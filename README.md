@@ -150,7 +150,9 @@ Every step above is a real, tested code path — not a hypothetical.
 
 ```
 bloodconnect-donor-matching/
+├── render.yaml          Render Blueprint — backend deploy config
 ├── frontend/   React app (Vite + Tailwind + React Router)
+│   ├── vercel.json       SPA rewrite so React Router routes work on Vercel
 │   └── src/
 │       ├── api/               one small module per backend resource
 │       │   ├── client.js      shared fetch wrapper (auth header, JSON, errors)
@@ -760,27 +762,37 @@ frontend needs the backend's URL.
 
 ### 2. Backend — Render
 
+The repo includes `render.yaml` (a Render **Blueprint**), so Render can
+configure most of this automatically:
+
 1. Push this repo to GitHub (already done if you're reading this there).
-2. On [render.com](https://render.com), **New → Web Service**, connect
-   the repo.
-3. **Root directory:** `backend`
-4. **Build command:** `npm install && npx prisma migrate deploy && npx prisma generate`
-   (`migrate deploy` applies committed migrations without prompting —
-   the production-safe counterpart to `migrate dev`, which is for local
-   development only)
-5. **Start command:** `npm start`
-6. **Environment variables** (Render dashboard → Environment):
+2. On [render.com](https://render.com), **New → Blueprint**, connect the
+   repo. Render reads `render.yaml` and pre-fills the service (root
+   directory `backend`, build command, start command, `JWT_SECRET`
+   auto-generated).
+3. It will prompt you for the two values it can't know on its own:
    - `DATABASE_URL` — the Neon connection string from step 1
-   - `JWT_SECRET` — a fresh random value (generate the same way as
-     local dev; **do not** reuse your local `.env` value)
-   - `FRONTEND_URL` — your Vercel URL from step 3 below (you'll come
-     back and set this after deploying the frontend)
-   - `PORT` — Render sets this automatically; the app already reads
-     `process.env.PORT` with a fallback, so no action needed
-7. Deploy. Confirm with `curl https://<your-render-url>/api/health` —
+   - `FRONTEND_URL` — leave blank for now; you'll set it after step 3
+     below, once you have a Vercel URL
+4. Deploy. Confirm with `curl https://<your-render-url>/api/health` —
    expect `{"message":"...","database":"connected"}`.
 
+*(No `render.yaml`, or prefer doing it by hand? **New → Web Service**
+instead, and set root directory `backend`, build command
+`npm install && npx prisma migrate deploy && npx prisma generate`
+— `migrate deploy` applies committed migrations without prompting, the
+production-safe counterpart to `migrate dev` which is for local dev only
+— start command `npm start`, and the same three env vars above plus your
+own `JWT_SECRET`, generated the same way as local dev and never reused
+from your `.env`.)*
+
 ### 3. Frontend — Vercel
+
+`frontend/vercel.json` is already in the repo — it rewrites every path to
+`index.html` so React Router's client-side routes (e.g. `/dashboard`,
+`/requests/:id`) work on direct load/refresh instead of 404ing (Vercel's
+static hosting otherwise looks for a matching file per URL, which a
+single-page app doesn't have).
 
 1. On [vercel.com](https://vercel.com), **New Project**, import the same
    repo.
