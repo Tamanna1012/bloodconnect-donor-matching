@@ -2,6 +2,7 @@ import express from 'express'
 import cors from 'cors'
 import prisma from './utils/prisma.js'
 import authRoutes from './routes/authRoutes.js'
+import bloodRequestRoutes from './routes/bloodRequestRoutes.js'
 
 const app = express()
 
@@ -18,5 +19,6 @@ app.get('/api/health', async (req, res) => {
 })
 
 app.use('/api/auth', authRoutes)
+app.use('/api/requests', bloodRequestRoutes)
 
 export default app
