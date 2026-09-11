@@ -2,14 +2,15 @@
 
 Blood Donor–Recipient Matching & Emergency Alert System.
 
-> **Status: Phase 4 — Authorization.** Frontend/backend scaffolds are wired
-> together, the PostgreSQL schema is migrated, users can register/log in,
-> and `BloodRequest` CRUD now exists with resource-level ownership checks
-> (a logged-in user cannot edit/cancel another user's request just by
-> guessing its ID). The matching engine, donor-side endpoints, and the
-> formal request state machine are not built yet — they arrive in later
-> phases. This README will be expanded into a full project write-up
-> (architecture, matching algorithm, API reference, setup, testing,
+> **Status: Phase 5 — Blood compatibility function.** Frontend/backend
+> scaffolds are wired together, the PostgreSQL schema is migrated, users
+> can register/log in, `BloodRequest` CRUD has ownership checks, and there's
+> now a pure, deterministic `isCompatible()` function implementing the
+> standard ABO/Rh transfusion rule (verified against all 64 donor/recipient
+> combinations). The full donor-ranking matching engine, donor-side
+> endpoints, and the formal request state machine are not built yet — they
+> arrive in later phases. This README will be expanded into a full project
+> write-up (architecture, matching algorithm, API reference, setup, testing,
 > deployment, limitations) as those phases are completed.
 
 ## What is this project?
@@ -45,7 +46,8 @@ bloodconnect-donor-matching/
 │       │   └── bloodRequestRoutes.js     /api/requests CRUD
 │       ├── services/
 │       │   ├── authService.js            auth business logic (bcrypt + JWT)
-│       │   └── bloodRequestService.js    CRUD + ownership enforcement
+│       │   ├── bloodRequestService.js    CRUD + ownership enforcement
+│       │   └── bloodCompatibility.js     isCompatible() — ABO/Rh screening rule
 │       ├── middleware/
 │       │   └── authMiddleware.js   requireAuth — protects routes via JWT
 │       ├── utils/
@@ -56,7 +58,8 @@ bloodconnect-donor-matching/
 │       ├── tests/
 │       │   ├── auth.service.test.js
 │       │   ├── authMiddleware.test.js
-│       │   └── bloodRequest.service.test.js
+│       │   ├── bloodRequest.service.test.js
+│       │   └── bloodCompatibility.test.js
 │       ├── app.js         Express app + middleware + routes
 │       └── server.js      starts the HTTP server
 │   └── prisma/
@@ -93,6 +96,52 @@ DonorProfile
 - `DonorMatch` is a join table between `BloodRequest` and `DonorProfile`
   carrying its own data (`score`, `status`); a unique constraint on
   `(requestId, donorProfileId)` stops duplicate matches.
+
+## Blood compatibility (`isCompatible`)
+
+`backend/src/services/bloodCompatibility.js` exports one pure function:
+
+```js
+isCompatible(donorBloodGroup, recipientBloodGroup) // -> boolean
+```
+
+It implements the standard **ABO/Rh** red-cell transfusion compatibility
+model — not an invented rule. The core idea: red blood cells carry
+**antigens** (A, B, and Rh), and a transfusion is safe only when the
+donor's antigens are a subset of the recipient's antigens (nothing "foreign"
+for the recipient's immune system to attack):
+
+- `O` carries no ABO antigens → **O can donate to anyone** (universal donor).
+- `AB` carries both A and B antigens → an **AB recipient can receive from
+  anyone** (universal recipient) — their body already recognizes A and B.
+- `Rh-` carries no Rh antigen → **Rh- can donate to both Rh- and Rh+**;
+  `Rh+` can only donate to `Rh+`.
+
+That single "antigen subset" rule — implemented once for ABO and once for
+Rh — reproduces the *entire* standard compatibility chart, instead of
+hand-copying a 64-cell lookup table:
+
+```
+Donor   -> Compatible recipients
+O-      -> O-, O+, A-, A+, B-, B+, AB-, AB+   (universal donor)
+O+      -> O+, A+, B+, AB+
+A-      -> A-, A+, AB-, AB+
+A+      -> A+, AB+
+B-      -> B-, B+, AB-, AB+
+B+      -> B+, AB+
+AB-     -> AB-, AB+
+AB+     -> AB+                                 (most restrictive donor)
+```
+
+`backend/src/tests/bloodCompatibility.test.js` doesn't just spot-check a
+few pairs — it checks **all 64 donor × recipient combinations** against a
+hardcoded reference table matching the real medical chart, plus named
+landmark cases (O- universal donor, AB+ universal recipient, etc).
+
+**This is a software screening rule only** — it filters/ranks candidate
+donors for the app's matching engine. It is never a substitute for the
+actual cross-match and medical verification a blood bank performs before
+any real transfusion.
 
 ## Authentication
 
@@ -196,13 +245,15 @@ npm test
 ```
 
 Runs Node's built-in test runner (`node --test`) against
-`backend/src/tests/*.test.js`. These are integration tests — they hit a real
-Postgres database through Prisma (using whatever `DATABASE_URL` is in your
-`.env`), not a mock, and clean up the rows they create afterward. Current
-coverage: registration success, duplicate-email rejection, login success,
+`backend/src/tests/*.test.js`. Most of these are integration tests — they
+hit a real Postgres database through Prisma (using whatever `DATABASE_URL`
+is in your `.env`), not a mock, and clean up the rows they create
+afterward. `bloodCompatibility.test.js` is a pure unit test — no database
+involved, since `isCompatible()` is a pure function. Current coverage (20
+tests): registration success, duplicate-email rejection, login success,
 wrong-password rejection, the auth middleware rejecting missing/invalid
-tokens, blood-request CRUD, and ownership rejection (a non-owner getting
-403 on update/cancel).
+tokens, blood-request CRUD, ownership rejection (a non-owner getting 403 on
+update/cancel), and all 64 ABO/Rh compatibility combinations.
 
 ## Limitations (current phase)
 
