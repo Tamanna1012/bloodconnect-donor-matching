@@ -5,6 +5,7 @@ import authRoutes from './routes/authRoutes.js'
 import bloodRequestRoutes from './routes/bloodRequestRoutes.js'
 import donorRoutes from './routes/donorRoutes.js'
 import matchRoutes from './routes/matchRoutes.js'
+import notificationRoutes from './routes/notificationRoutes.js'
 
 const app = express()
 
@@ -24,5 +25,6 @@ app.use('/api/auth', authRoutes)
 app.use('/api/requests', bloodRequestRoutes)
 app.use('/api/donors', donorRoutes)
 app.use('/api/matches', matchRoutes)
+app.use('/api/notifications', notificationRoutes)
 
 export default app

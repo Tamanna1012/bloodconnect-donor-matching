@@ -6,6 +6,8 @@ import {
   applyRequestStatusTransition,
 } from './bloodRequestService.js'
 import { sanitizeDonorProfile } from './donorService.js'
+import { createNotification, NOTIFICATION_TYPES } from './notificationService.js'
+import { formatBloodGroup, formatUrgency } from '../utils/formatters.js'
 
 /**
  * Runs the matching engine for a request and persists the results as
@@ -79,9 +81,26 @@ export async function findMatchesForRequest(requestId, requestingUserId) {
     })
   }
 
-  // TODO (Phase 10): create a Notification row per newly matched donor here.
+  if (newlyMatchedDonorProfileIds.length > 0) {
+    const matchMessage =
+      `${formatUrgency(request.urgency)} ${formatBloodGroup(request.bloodGroup)} ` +
+      `blood request near you.`
+
+    const newlyMatched = persistedMatches.filter((m) =>
+      newlyMatchedDonorProfileIds.includes(m.donorProfileId),
+    )
+    for (const match of newlyMatched) {
+      await createNotification(match.donorProfile.userId, NOTIFICATION_TYPES.MATCH_FOUND, matchMessage)
+    }
+  }
+
   if (persistedMatches.length > 0 && currentStatus !== 'DONOR_CONTACTED') {
     await applyRequestStatusTransition(requestId, 'DONOR_CONTACTED')
+    await createNotification(
+      request.requesterId,
+      NOTIFICATION_TYPES.DONOR_CONTACTED,
+      'We found and contacted a matching donor for your request.',
+    )
   }
 
   return persistedMatches.map((match) => ({
@@ -137,7 +156,11 @@ export async function acceptMatch(matchId, donorUserId) {
     data: { requestsAccepted: { increment: 1 } },
   })
 
-  // TODO (Phase 10): notify the recipient that a donor accepted.
+  await createNotification(
+    match.request.requesterId,
+    NOTIFICATION_TYPES.DONOR_ACCEPTED,
+    'A donor has accepted your blood request.',
+  )
   return updatedMatch
 }
 
@@ -166,6 +189,34 @@ export async function declineMatch(matchId, donorUserId) {
     await applyRequestStatusTransition(match.requestId, 'MATCHING')
   }
 
-  // TODO (Phase 10): notify the recipient that a donor declined.
+  await createNotification(
+    match.request.requesterId,
+    NOTIFICATION_TYPES.DONOR_DECLINED,
+    "A donor declined your blood request. We're searching for another match.",
+  )
   return updatedMatch
+}
+
+// Called by bloodRequestController after a request successfully
+// transitions to FULFILLED. Lives here (not in bloodRequestService) to
+// avoid a circular import -- matchService already depends on
+// bloodRequestService, not the other way around.
+export async function rewardDonorOnFulfilled(requestId) {
+  const acceptedMatch = await prisma.donorMatch.findFirst({
+    where: { requestId, status: 'ACCEPTED' },
+  })
+  if (!acceptedMatch) return null
+
+  const donorProfile = await prisma.donorProfile.update({
+    where: { id: acceptedMatch.donorProfileId },
+    data: { donationsCompleted: { increment: 1 } },
+  })
+
+  await createNotification(
+    donorProfile.userId,
+    NOTIFICATION_TYPES.REQUEST_FULFILLED,
+    'Thank you — your donation was recorded as fulfilled.',
+  )
+
+  return donorProfile
 }

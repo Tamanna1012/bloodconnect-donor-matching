@@ -9,7 +9,10 @@ import {
   findMatchesForRequest,
   acceptMatch,
   declineMatch,
+  rewardDonorOnFulfilled,
 } from '../services/matchService.js'
+import { transitionBloodRequestStatus } from '../services/bloodRequestService.js'
+import { NOTIFICATION_TYPES } from '../services/notificationService.js'
 
 function uniqueEmail() {
   return `test-${Date.now()}-${Math.random().toString(36).slice(2)}@example.com`
@@ -40,6 +43,9 @@ async function makeScenario() {
 }
 
 async function cleanupScenario({ recipient, donorUser, request }) {
+  await prisma.notification.deleteMany({
+    where: { userId: { in: [recipient.id, donorUser.id] } },
+  })
   await prisma.donorMatch.deleteMany({ where: { requestId: request.id } })
   await prisma.donorProfile.deleteMany({ where: { userId: donorUser.id } })
   await prisma.bloodRequest.deleteMany({ where: { id: request.id } })
@@ -164,6 +170,70 @@ test('declining an already-declined match is rejected', async () => {
       return true
     },
   )
+
+  await cleanupScenario(scenario)
+})
+
+test('findMatchesForRequest notifies the matched donor and the recipient', async () => {
+  const scenario = await makeScenario()
+  await findMatchesForRequest(scenario.request.id, scenario.recipient.id)
+
+  const donorNotifications = await prisma.notification.findMany({
+    where: { userId: scenario.donorUser.id },
+  })
+  assert.equal(donorNotifications.length, 1)
+  assert.equal(donorNotifications[0].type, NOTIFICATION_TYPES.MATCH_FOUND)
+
+  const recipientNotifications = await prisma.notification.findMany({
+    where: { userId: scenario.recipient.id },
+  })
+  assert.equal(recipientNotifications.length, 1)
+  assert.equal(recipientNotifications[0].type, NOTIFICATION_TYPES.DONOR_CONTACTED)
+
+  await cleanupScenario(scenario)
+})
+
+test('accepting a match notifies the recipient with DONOR_ACCEPTED', async () => {
+  const scenario = await makeScenario()
+  const [match] = await findMatchesForRequest(scenario.request.id, scenario.recipient.id)
+  await acceptMatch(match.id, scenario.donorUser.id)
+
+  const notifications = await prisma.notification.findMany({
+    where: { userId: scenario.recipient.id, type: NOTIFICATION_TYPES.DONOR_ACCEPTED },
+  })
+  assert.equal(notifications.length, 1)
+
+  await cleanupScenario(scenario)
+})
+
+test('declining a match notifies the recipient with DONOR_DECLINED', async () => {
+  const scenario = await makeScenario()
+  const [match] = await findMatchesForRequest(scenario.request.id, scenario.recipient.id)
+  await declineMatch(match.id, scenario.donorUser.id)
+
+  const notifications = await prisma.notification.findMany({
+    where: { userId: scenario.recipient.id, type: NOTIFICATION_TYPES.DONOR_DECLINED },
+  })
+  assert.equal(notifications.length, 1)
+
+  await cleanupScenario(scenario)
+})
+
+test('rewardDonorOnFulfilled increments donationsCompleted and notifies the donor', async () => {
+  const scenario = await makeScenario()
+  const [match] = await findMatchesForRequest(scenario.request.id, scenario.recipient.id)
+  await acceptMatch(match.id, scenario.donorUser.id)
+  await transitionBloodRequestStatus(scenario.request.id, scenario.recipient.id, 'FULFILLED')
+
+  await rewardDonorOnFulfilled(scenario.request.id)
+
+  const donor = await prisma.donorProfile.findUnique({ where: { id: scenario.donorProfile.id } })
+  assert.equal(donor.donationsCompleted, 1)
+
+  const notifications = await prisma.notification.findMany({
+    where: { userId: scenario.donorUser.id, type: NOTIFICATION_TYPES.REQUEST_FULFILLED },
+  })
+  assert.equal(notifications.length, 1)
 
   await cleanupScenario(scenario)
 })

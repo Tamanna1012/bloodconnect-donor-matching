@@ -2,17 +2,20 @@
 
 Blood Donor–Recipient Matching & Emergency Alert System.
 
-> **Status: Phase 9 — REST APIs.** The full donor-to-recipient loop now
-> works end to end over real HTTP: a donor creates a profile, a recipient
-> creates a request, `GET /api/requests/:id/matches` runs the matching
-> engine and persists ranked `DonorMatch` rows, and the matched donor can
-> accept or decline — each of which drives the `BloodRequest` state
-> machine automatically. Verified live against the running server —
-> including a real bug found and fixed by actually re-running the flow
-> twice, not just once (see "Donor matching & ranking engine" below).
-> Only in-app notifications remain unbuilt — that's the next phase. This README will be expanded into a full project
-> write-up (architecture, matching algorithm, API reference, setup,
-> testing, deployment, limitations) as remaining phases are completed.
+> **Status: Phase 10 — In-app notifications.** The backend is functionally
+> complete: register/login, blood-request CRUD with ownership, the
+> donor-matching/ranking engine, the request state machine, donor
+> profiles, match accept/decline, and now database-backed notifications
+> fire at every meaningful event (a donor is matched, a recipient's donors
+> are contacted, a donor accepts/declines, a donation is marked
+> fulfilled) — the last one also finally closes the loop on
+> `donationsCompleted`, the field the Phase 6/7 reliability score depends
+> on. Verified live end to end against the running server. What's left is
+> the React frontend (so far only a health-check page exists), security
+> hardening, and deployment. This README will be expanded into a full
+> project write-up (architecture, matching algorithm, API reference,
+> setup, testing, deployment, limitations) as remaining phases are
+> completed.
 
 ## What is this project?
 
@@ -43,17 +46,20 @@ bloodconnect-donor-matching/
 │       │   ├── authController.js         register/login/me request handlers
 │       │   ├── bloodRequestController.js create/list/get/update/status/cancel
 │       │   ├── donorController.js        donor profile/availability/browse
-│       │   └── matchController.js        find matches, accept, decline
+│       │   ├── matchController.js        find matches, accept, decline
+│       │   └── notificationController.js list, mark read
 │       ├── routes/
 │       │   ├── authRoutes.js             POST /register, POST /login, GET /me
 │       │   ├── bloodRequestRoutes.js     /api/requests CRUD + /:id/matches
 │       │   ├── donorRoutes.js            /api/donors
-│       │   └── matchRoutes.js            /api/matches/:id/accept, /decline
+│       │   ├── matchRoutes.js            /api/matches/:id/accept, /decline
+│       │   └── notificationRoutes.js     /api/notifications
 │       ├── services/
 │       │   ├── authService.js            auth business logic (bcrypt + JWT)
 │       │   ├── bloodRequestService.js    CRUD + ownership + state transitions
 │       │   ├── donorService.js           donor profile CRUD + sanitization
 │       │   ├── matchService.js           orchestrates matching + accept/decline
+│       │   ├── notificationService.js    create/list/mark-read
 │       │   ├── bloodCompatibility.js     isCompatible() — ABO/Rh screening rule
 │       │   ├── proximity.js              Haversine distance + proximity score
 │       │   ├── donorReliability.js       reliability score from donor history
@@ -65,13 +71,15 @@ bloodconnect-donor-matching/
 │       │   ├── prisma.js           shared PrismaClient instance
 │       │   ├── jwt.js              sign/verify JWT helpers
 │       │   ├── validators.js       email/password/blood-group/urgency/coordinate checks
-│       │   └── httpErrors.js       assertFound / assertOwnership helpers
+│       │   ├── httpErrors.js       assertFound / assertOwnership helpers
+│       │   └── formatters.js       human-readable blood group / urgency labels
 │       ├── tests/
 │       │   ├── auth.service.test.js
 │       │   ├── authMiddleware.test.js
 │       │   ├── bloodRequest.service.test.js
 │       │   ├── donorService.test.js
 │       │   ├── matchService.test.js
+│       │   ├── notificationService.test.js
 │       │   ├── proximity.test.js
 │       │   ├── donorReliability.test.js
 │       │   ├── requestStateMachine.test.js
@@ -327,6 +335,52 @@ already verified a *different* ownership relationship (the donor owns the
 (`assertValidTransition`) is enforced identically either way; only the
 "who's allowed to trigger this" check differs by caller.
 
+## Notifications
+
+Database-backed only — no SMS, WhatsApp, Firebase, or Socket.io.
+`notificationService.js` is deliberately tiny: `createNotification`,
+`listNotificationsForUser`, `markNotificationRead` (ownership-checked,
+same `assertOwnership` pattern as everything else). The actual
+notification-triggering logic lives where the *event* happens —
+`matchService.js` — not inside the notification service itself, since the
+notification service shouldn't need to know *why* it's being called.
+
+| Event (in `matchService.js`) | Recipient of the notification | Type |
+|---|---|---|
+| A donor is newly matched | The donor | `MATCH_FOUND` |
+| Donors found/contacted for a request (first time) | The recipient | `DONOR_CONTACTED` |
+| A donor accepts | The recipient | `DONOR_ACCEPTED` |
+| A donor declines | The recipient | `DONOR_DECLINED` |
+| Request marked `FULFILLED` | The donor who was `ACCEPTED` | `REQUEST_FULFILLED` |
+
+The `MATCH_FOUND` message is built from the request's own urgency and
+blood group — e.g. `"Emergency A+ blood request near you."` — matching
+the example phrasing from the spec, using two tiny formatting helpers
+(`formatUrgency`, `formatBloodGroup` in `utils/formatters.js`) rather than
+hardcoding message strings per blood group.
+
+**Closing a real gap:** `DonorProfile.donationsCompleted` — the field the
+Phase 6/7 reliability score has depended on since the matching engine was
+built — had never actually been incremented anywhere until this phase.
+`rewardDonorOnFulfilled(requestId)` (called from
+`bloodRequestController.transitionStatus` only when the new status is
+`FULFILLED`) finds the request's `ACCEPTED` `DonorMatch`, increments that
+donor's `donationsCompleted`, and sends them the `REQUEST_FULFILLED`
+notification. This function lives in `matchService.js`, not
+`bloodRequestService.js` — putting it in `bloodRequestService.js` would
+require importing from `matchService.js`, which already imports from
+`bloodRequestService.js`, creating a circular dependency. Keeping the
+"reward the donor" orchestration in the controller, calling into
+whichever service owns each piece of data, avoids that.
+
+I verified the entire chain live: donor gets `MATCH_FOUND` the moment
+they're matched (message read exactly `"Emergency A+ blood request near
+you."`), recipient gets `DONOR_CONTACTED` then `DONOR_ACCEPTED`, marking
+the request `FULFILLED` gave the donor a `REQUEST_FULFILLED` notification
+*and* bumped `donationsCompleted` from 0 to 1, marking a notification read
+worked, and a different user trying to mark someone else's notification
+read correctly got `403`.
+
 ## Authentication
 
 - **Registration** (`POST /api/auth/register`) — validates input, checks the
@@ -407,10 +461,10 @@ how the two ownership paths connect to the same underlying state machine.
 | `PUT /api/donors/availability` | required | Toggle the caller's own `isAvailable` |
 | `GET /api/donors` | required | Browse donors (sanitized — no exact coordinates); optional `?bloodGroup=`, `?city=` filters |
 | `GET /api/donors/:id` | required | One donor's sanitized public profile |
-| `POST /api/matches/:id/accept` | matched donor only | Match → `ACCEPTED`, request → `ACCEPTED` |
-| `POST /api/matches/:id/decline` | matched donor only | Match → `DECLINED`, request → `MATCHING` (if still awaiting this donor) |
-
-Notification endpoints (`GET /api/notifications`, `PUT /api/notifications/:id/read`) are not built yet — see Limitations.
+| `POST /api/matches/:id/accept` | matched donor only | Match → `ACCEPTED`, request → `ACCEPTED`; notifies the recipient |
+| `POST /api/matches/:id/decline` | matched donor only | Match → `DECLINED`, request → `MATCHING` (if still awaiting this donor); notifies the recipient |
+| `GET /api/notifications` | required | The caller's own notifications, newest first |
+| `PUT /api/notifications/:id/read` | owner only | Marks one notification as read |
 
 ## Running locally
 
@@ -458,45 +512,50 @@ npm test
 ```
 
 Runs Node's built-in test runner (`node --test`) against
-`backend/src/tests/*.test.js`. Auth, blood-request, donor, and match tests
-are integration tests — they hit a real Postgres database through Prisma
-(using whatever `DATABASE_URL` is in your `.env`), not a mock, and clean
-up the rows they create afterward. `bloodCompatibility.test.js`,
-`proximity.test.js`, `donorReliability.test.js`,
-`bloodMatchingEngine.test.js`, and `requestStateMachine.test.js` are pure
-unit tests — no database involved. Current coverage (67 tests) includes:
-registration/login/duplicate-email/wrong-password, auth-middleware
-rejection, blood-request CRUD + ownership rejection, all 64 ABO/Rh
-compatibility combinations, Haversine distance correctness and proximity
-score buckets, reliability scoring, the matching engine (hard filters +
-ranking by distance/urgency/reliability), the request state machine
-(every valid transition, the `FULFILLED → OPEN` rejection, skipped-step
-rejection, non-owner rejection, cancelling an already-`FULFILLED` request
-being correctly rejected), donor profile CRUD + sanitization + filtering,
-and the full match lifecycle (matching creates `DONOR_CONTACTED`, accept
-drives the request to `ACCEPTED` and updates reliability counters, a
-non-donor can't accept someone else's match, decline bounces the request
-back to `MATCHING`, and double-accept/double-decline are rejected).
+`backend/src/tests/*.test.js`. Auth, blood-request, donor, match, and
+notification tests are integration tests — they hit a real Postgres
+database through Prisma (using whatever `DATABASE_URL` is in your
+`.env`), not a mock, and clean up the rows they create afterward.
+`bloodCompatibility.test.js`, `proximity.test.js`,
+`donorReliability.test.js`, `bloodMatchingEngine.test.js`, and
+`requestStateMachine.test.js` are pure unit tests — no database involved.
+Current coverage (75 tests) includes: registration/login/duplicate-email/
+wrong-password, auth-middleware rejection, blood-request CRUD + ownership
+rejection, all 64 ABO/Rh compatibility combinations, Haversine distance
+correctness and proximity score buckets, reliability scoring, the
+matching engine (hard filters + ranking by distance/urgency/reliability),
+the request state machine (every valid transition, the `FULFILLED →
+OPEN` rejection, skipped-step rejection, non-owner rejection, cancelling
+an already-`FULFILLED` request being correctly rejected), donor profile
+CRUD + sanitization + filtering, the full match lifecycle (matching
+creates `DONOR_CONTACTED`, accept drives the request to `ACCEPTED` and
+updates reliability counters, a non-donor can't accept someone else's
+match, decline bounces the request back to `MATCHING`, double-accept/
+double-decline are rejected), and notifications (creation, newest-first
+ordering, mark-as-read ownership rejection, 404 on a bad id, and that
+matching/accept/decline/fulfilling each fire the right notification type
+to the right person, including `rewardDonorOnFulfilled` correctly
+incrementing `donationsCompleted`).
 
 ## Limitations (current phase)
 
-- No notification endpoints or Notification rows yet — `matchService.js`
-  has `// TODO (Phase 10)` comments exactly where notifications need to be
-  created (on new match, on accept, on decline); the next phase fills
-  these in and adds `GET /api/notifications` / `PUT /api/notifications/:id/read`.
 - `requestsReceived` increments once per donor per request (the first time
   they're matched), which is correct, but there's no equivalent tracking
   for "how many times has this donor's phone/email actually been used to
-  contact them" — that's a notification-system concern, not this layer's.
+  contact them" — that's out of scope; this app is in-app only.
 - If two donors are both `PENDING` on the same request and one accepts,
   the other's `PENDING` match is left dangling rather than being
   auto-declined. Accepting it later correctly fails (`400`, request no
   longer `DONOR_CONTACTED`), but a nicer UX would proactively decline the
-  remaining pending matches the moment one is accepted — not implemented,
-  to keep this phase's scope focused.
+  remaining pending matches (and notify those donors) the moment one is
+  accepted — not implemented, to keep this phase's scope focused.
 - `GET /api/requests/:id/matches` intentionally has a side effect (see the
   REST-semantics note above) — a stricter API would split trigger and
   read into separate endpoints.
+- No push/email/SMS delivery — notifications only exist inside the
+  database until a frontend polls `GET /api/notifications` and displays
+  them. This is intentional (the spec explicitly asks for in-app
+  notifications only, not third-party services), not an oversight.
 - Logout is client-side only (delete the token) — there's no server-side
   token blacklist, so a stolen token remains valid until it expires (7
   days). A production system might add a short-lived access token + refresh

@@ -7,6 +7,7 @@ import {
   transitionBloodRequestStatus,
 } from '../services/bloodRequestService.js'
 import { REQUEST_STATE_TRANSITIONS } from '../services/requestStateMachine.js'
+import { rewardDonorOnFulfilled } from '../services/matchService.js'
 import {
   isValidBloodGroup,
   isValidUrgency,
@@ -82,6 +83,9 @@ export async function transitionStatus(req, res) {
 
   try {
     const request = await transitionBloodRequestStatus(req.params.id, req.user.id, status)
+    if (status === 'FULFILLED') {
+      await rewardDonorOnFulfilled(request.id)
+    }
     res.status(200).json({ request })
   } catch (err) {
     res.status(err.statusCode || 500).json({ error: err.message })
