@@ -1,6 +1,7 @@
 import express from 'express'
 import cors from 'cors'
 import prisma from './utils/prisma.js'
+import authRoutes from './routes/authRoutes.js'
 
 const app = express()
 
@@ -15,5 +16,7 @@ app.get('/api/health', async (req, res) => {
     res.status(500).json({ message: 'BloodConnect backend is running', database: 'unreachable' })
   }
 })
+
+app.use('/api/auth', authRoutes)
 
 export default app
