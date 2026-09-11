@@ -1,0 +1,121 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum BloodGroup {
+  A_POS
+  A_NEG
+  B_POS
+  B_NEG
+  AB_POS
+  AB_NEG
+  O_POS
+  O_NEG
+}
+
+enum Urgency {
+  NORMAL
+  URGENT
+  EMERGENCY
+}
+
+enum RequestStatus {
+  OPEN
+  MATCHING
+  DONOR_CONTACTED
+  ACCEPTED
+  FULFILLED
+  CANCELLED
+}
+
+enum MatchStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+}
+
+model User {
+  id        String   @id @default(uuid())
+  name      String
+  email     String   @unique
+  password  String
+  phone     String?
+  city      String?
+  createdAt DateTime @default(now())
+
+  donorProfile  DonorProfile?
+  bloodRequests BloodRequest[]
+  notifications Notification[]
+}
+
+model DonorProfile {
+  id          String     @id @default(uuid())
+  userId      String     @unique
+  user        User       @relation(fields: [userId], references: [id])
+  bloodGroup  BloodGroup
+  city        String
+  latitude    Float?
+  longitude   Float?
+  isAvailable Boolean    @default(true)
+
+  // Reliability tracking (Phase 7)
+  requestsReceived   Int @default(0)
+  requestsAccepted   Int @default(0)
+  requestsDeclined   Int @default(0)
+  donationsCompleted Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  matches DonorMatch[]
+}
+
+model BloodRequest {
+  id          String        @id @default(uuid())
+  requesterId String
+  requester   User          @relation(fields: [requesterId], references: [id])
+  bloodGroup  BloodGroup
+  units       Int
+  city        String
+  latitude    Float?
+  longitude   Float?
+  urgency     Urgency       @default(NORMAL)
+  description String?
+  requiredBy  DateTime?
+  status      RequestStatus @default(OPEN)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  matches DonorMatch[]
+}
+
+model DonorMatch {
+  id             String       @id @default(uuid())
+  requestId      String
+  request        BloodRequest @relation(fields: [requestId], references: [id])
+  donorProfileId String
+  donorProfile   DonorProfile @relation(fields: [donorProfileId], references: [id])
+  score          Float
+  status         MatchStatus  @default(PENDING)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([requestId, donorProfileId])
+}
+
+model Notification {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  message   String
+  type      String
+  isRead    Boolean  @default(false)
+  createdAt DateTime @default(now())
+}
