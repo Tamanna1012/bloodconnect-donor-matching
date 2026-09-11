@@ -30,3 +30,11 @@ export function isValidUrgency(urgency) {
 export function isPositiveInteger(value) {
   return Number.isInteger(value) && value > 0
 }
+
+export function isValidLatitude(value) {
+  return typeof value === 'number' && value >= -90 && value <= 90
+}
+
+export function isValidLongitude(value) {
+  return typeof value === 'number' && value >= -180 && value <= 180
+}

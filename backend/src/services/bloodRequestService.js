@@ -46,9 +46,21 @@ export async function updateBloodRequest(id, requestingUserId, updates) {
   })
 }
 
+// The public, owner-checked path -- for transitions the REQUESTER
+// triggers directly (e.g. cancelling their own request).
 export async function transitionBloodRequestStatus(id, requestingUserId, nextStatus) {
   const request = await getBloodRequestById(id)
   assertOwnership(request.requesterId, requestingUserId, 'blood request')
+  return applyRequestStatusTransition(id, nextStatus)
+}
+
+// The internal path -- NO ownership check. Only for callers that have
+// already authorized the action themselves against a DIFFERENT owner
+// field. Example: a donor accepting a match owns the DonorMatch (via
+// donorProfile.userId), not the BloodRequest -- matchService checks that
+// ownership, then calls this to move the request forward.
+export async function applyRequestStatusTransition(id, nextStatus) {
+  const request = await getBloodRequestById(id)
   assertValidTransition(request.status, nextStatus)
 
   return prisma.bloodRequest.update({

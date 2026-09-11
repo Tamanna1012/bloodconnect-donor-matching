@@ -2,18 +2,17 @@
 
 Blood Donor–Recipient Matching & Emergency Alert System.
 
-> **Status: Phase 8 — Request state machine.** Frontend/backend scaffolds
-> are wired together, the PostgreSQL schema is migrated, users can
-> register/log in, `BloodRequest` CRUD has ownership checks, the core
-> donor matching/ranking engine exists and is verified against real
-> Postgres data, and `BloodRequest.status` now moves only through a
-> validated set of transitions (`OPEN → MATCHING → DONOR_CONTACTED →
-> ACCEPTED → FULFILLED`, with `CANCELLED` reachable from most states, and
-> `FULFILLED`/`CANCELLED` as terminal states) instead of being freely
-> overwritable. Donor-facing API endpoints and notifications are not built
-> yet — they arrive in later phases. This README will be expanded into a
-> full project write-up (architecture, matching algorithm, API reference,
-> setup, testing, deployment, limitations) as those phases are completed.
+> **Status: Phase 9 — REST APIs.** The full donor-to-recipient loop now
+> works end to end over real HTTP: a donor creates a profile, a recipient
+> creates a request, `GET /api/requests/:id/matches` runs the matching
+> engine and persists ranked `DonorMatch` rows, and the matched donor can
+> accept or decline — each of which drives the `BloodRequest` state
+> machine automatically. Verified live against the running server —
+> including a real bug found and fixed by actually re-running the flow
+> twice, not just once (see "Donor matching & ranking engine" below).
+> Only in-app notifications remain unbuilt — that's the next phase. This README will be expanded into a full project
+> write-up (architecture, matching algorithm, API reference, setup,
+> testing, deployment, limitations) as remaining phases are completed.
 
 ## What is this project?
 
@@ -42,13 +41,19 @@ bloodconnect-donor-matching/
 │   └── src/
 │       ├── controllers/
 │       │   ├── authController.js         register/login/me request handlers
-│       │   └── bloodRequestController.js create/list/get/update/cancel
+│       │   ├── bloodRequestController.js create/list/get/update/status/cancel
+│       │   ├── donorController.js        donor profile/availability/browse
+│       │   └── matchController.js        find matches, accept, decline
 │       ├── routes/
 │       │   ├── authRoutes.js             POST /register, POST /login, GET /me
-│       │   └── bloodRequestRoutes.js     /api/requests CRUD
+│       │   ├── bloodRequestRoutes.js     /api/requests CRUD + /:id/matches
+│       │   ├── donorRoutes.js            /api/donors
+│       │   └── matchRoutes.js            /api/matches/:id/accept, /decline
 │       ├── services/
 │       │   ├── authService.js            auth business logic (bcrypt + JWT)
-│       │   ├── bloodRequestService.js    CRUD + ownership enforcement
+│       │   ├── bloodRequestService.js    CRUD + ownership + state transitions
+│       │   ├── donorService.js           donor profile CRUD + sanitization
+│       │   ├── matchService.js           orchestrates matching + accept/decline
 │       │   ├── bloodCompatibility.js     isCompatible() — ABO/Rh screening rule
 │       │   ├── proximity.js              Haversine distance + proximity score
 │       │   ├── donorReliability.js       reliability score from donor history
@@ -59,12 +64,14 @@ bloodconnect-donor-matching/
 │       ├── utils/
 │       │   ├── prisma.js           shared PrismaClient instance
 │       │   ├── jwt.js              sign/verify JWT helpers
-│       │   ├── validators.js       email/password/blood-group/urgency checks
+│       │   ├── validators.js       email/password/blood-group/urgency/coordinate checks
 │       │   └── httpErrors.js       assertFound / assertOwnership helpers
 │       ├── tests/
 │       │   ├── auth.service.test.js
 │       │   ├── authMiddleware.test.js
 │       │   ├── bloodRequest.service.test.js
+│       │   ├── donorService.test.js
+│       │   ├── matchService.test.js
 │       │   ├── proximity.test.js
 │       │   ├── donorReliability.test.js
 │       │   ├── requestStateMachine.test.js
@@ -228,6 +235,37 @@ The B+ donor (incompatible) and the unavailable A- donor were correctly
 excluded before scoring even started; among the 3 eligible donors, distance
 and reliability both visibly move the ranking exactly as designed.
 
+**Now connected to real HTTP (Phase 9):** `GET /api/requests/:id/matches`
+calls `matchService.findMatchesForRequest`, which fetches real
+`DonorProfile` rows, runs `rankDonorsForRequest`, and persists each result
+as a `DonorMatch` (`upsert`, keyed on `(requestId, donorProfileId)`, so
+re-running it updates scores instead of creating duplicates). It also
+drives the state machine: `OPEN → MATCHING` before searching, then
+`MATCHING → DONOR_CONTACTED` once at least one eligible donor is found.
+
+**A real bug I found by testing the flow twice:** the first version of
+this function called `rankDonorsForRequest` unconditionally — which
+internally calls `validateRequestForMatching`, and that function correctly
+refuses to match a request that isn't `OPEN`/`MATCHING`. The problem: once
+the *first* call advances the request to `DONOR_CONTACTED`, a *second*
+call to the same endpoint (e.g. the recipient just refreshing the page to
+view matches) would hit that same validation and fail with `400 Cannot
+find donors for a request with status "DONOR_CONTACTED"` — even though
+nothing was actually wrong. I caught this by literally calling the
+endpoint twice against the running server, not just once. Fix:
+`findMatchesForRequest` now checks whether the request is still in a
+searchable state (`OPEN`/`MATCHING`) first; if not, it just returns the
+already-persisted matches instead of re-running the engine.
+
+A related correctness detail: naively incrementing a donor's
+`requestsReceived` counter on every call would inflate it every time the
+recipient refreshes — which would unfairly *lower* that donor's
+reliability score for no real reason (see Phase 6/7). Fixed by comparing
+`match.createdAt.getTime() === match.updatedAt.getTime()` right after the
+`upsert` — they're only equal on the instant a row is first created, so
+the counter only increments the first time a donor is actually matched to
+a given request, not on every re-run.
+
 ## Request state machine
 
 `BloodRequest.status` doesn't move freely between any two values — it
@@ -273,6 +311,21 @@ own example exactly: walked a real request through the full happy path
 then confirmed `FULFILLED → OPEN` is rejected with `400` — and confirmed
 `DELETE` on that same now-`FULFILLED` request is also correctly rejected,
 proving the bug above is actually fixed, not just theoretically fixed.
+
+**Two authorization paths onto the same state machine (Phase 9):** back
+in Phase 8, `transitionBloodRequestStatus` checked that the caller owned
+the request (`request.requesterId`) — fine for recipient-driven
+transitions like cancelling. But when a *donor* accepts a match, they need
+to drive `DONOR_CONTACTED → ACCEPTED`, and they are never the request's
+owner. Rather than weaken the ownership check, `bloodRequestService.js`
+now exposes two functions: the public, owner-checked
+`transitionBloodRequestStatus` (used by `PUT /:id/status`, for the
+recipient), and an internal `applyRequestStatusTransition` with no
+ownership check at all — used only by `matchService.js`, which has
+already verified a *different* ownership relationship (the donor owns the
+`DonorMatch`) before calling it. The state-machine rule itself
+(`assertValidTransition`) is enforced identically either way; only the
+"who's allowed to trigger this" check differs by caller.
 
 ## Authentication
 
@@ -331,6 +384,34 @@ had User A create a request, then confirmed User B gets `403` on `PUT` and
 all three. See `backend/src/tests/bloodRequest.service.test.js` for the
 automated version of the same scenario.
 
+`DonorMatch` extends the same ownership pattern to a different owner
+field: accepting/declining a match checks `donorProfile.userId` (the
+matched donor), not `requesterId`. See "Request state machine" above for
+how the two ownership paths connect to the same underlying state machine.
+
+## REST API reference
+
+| Method & Path | Auth | Notes |
+|---|---|---|
+| `POST /api/auth/register` | — | Create a user, returns `{ user, token }` |
+| `POST /api/auth/login` | — | Returns `{ user, token }` |
+| `GET /api/auth/me` | required | Current user, via `requireAuth` |
+| `POST /api/requests` | required | Creates a `BloodRequest`, caller becomes the owner |
+| `GET /api/requests` | required | List all requests (open browsing) |
+| `GET /api/requests/:id` | required | One request (open browsing) |
+| `PUT /api/requests/:id` | owner only | Update fields — **not** `status` |
+| `PUT /api/requests/:id/status` | owner only | The only way to change `status`; validated by the state machine |
+| `DELETE /api/requests/:id` | owner only | Cancels (sets `status: CANCELLED`) via the state machine, not a hard delete |
+| `GET /api/requests/:id/matches` | owner only | Runs the matching engine, persists `DonorMatch` rows, advances status — see the REST-semantics note above |
+| `PUT /api/donors/profile` | required | Create/update the caller's own `DonorProfile` (upsert — self-scoped, no id in the URL) |
+| `PUT /api/donors/availability` | required | Toggle the caller's own `isAvailable` |
+| `GET /api/donors` | required | Browse donors (sanitized — no exact coordinates); optional `?bloodGroup=`, `?city=` filters |
+| `GET /api/donors/:id` | required | One donor's sanitized public profile |
+| `POST /api/matches/:id/accept` | matched donor only | Match → `ACCEPTED`, request → `ACCEPTED` |
+| `POST /api/matches/:id/decline` | matched donor only | Match → `DECLINED`, request → `MATCHING` (if still awaiting this donor) |
+
+Notification endpoints (`GET /api/notifications`, `PUT /api/notifications/:id/read`) are not built yet — see Limitations.
+
 ## Running locally
 
 ### Backend
@@ -377,39 +458,45 @@ npm test
 ```
 
 Runs Node's built-in test runner (`node --test`) against
-`backend/src/tests/*.test.js`. Auth and blood-request tests are
-integration tests — they hit a real Postgres database through Prisma
+`backend/src/tests/*.test.js`. Auth, blood-request, donor, and match tests
+are integration tests — they hit a real Postgres database through Prisma
 (using whatever `DATABASE_URL` is in your `.env`), not a mock, and clean
 up the rows they create afterward. `bloodCompatibility.test.js`,
 `proximity.test.js`, `donorReliability.test.js`,
 `bloodMatchingEngine.test.js`, and `requestStateMachine.test.js` are pure
-unit tests — no database involved. Current coverage (54 tests) includes:
+unit tests — no database involved. Current coverage (67 tests) includes:
 registration/login/duplicate-email/wrong-password, auth-middleware
 rejection, blood-request CRUD + ownership rejection, all 64 ABO/Rh
 compatibility combinations, Haversine distance correctness and proximity
 score buckets, reliability scoring, the matching engine (hard filters +
-ranking by distance/urgency/reliability), and the request state machine
+ranking by distance/urgency/reliability), the request state machine
 (every valid transition, the `FULFILLED → OPEN` rejection, skipped-step
-rejection, non-owner rejection, and cancelling an already-`FULFILLED`
-request being correctly rejected).
+rejection, non-owner rejection, cancelling an already-`FULFILLED` request
+being correctly rejected), donor profile CRUD + sanitization + filtering,
+and the full match lifecycle (matching creates `DONOR_CONTACTED`, accept
+drives the request to `ACCEPTED` and updates reliability counters, a
+non-donor can't accept someone else's match, decline bounces the request
+back to `MATCHING`, and double-accept/double-decline are rejected).
 
 ## Limitations (current phase)
 
-- No donor-side or notification endpoints yet — the matching engine
-  (`bloodMatchingEngine.js`) is fully built and tested, but there's no
-  `GET /api/requests/:id/matches` HTTP endpoint yet, and no way to create
-  a `DonorProfile` via the API — those need the REST API phase.
-- Nothing calls `transitionBloodRequestStatus` automatically yet — moving
-  a request through `MATCHING`/`DONOR_CONTACTED`/`ACCEPTED` today requires
-  calling `PUT /:id/status` directly. Once donor-match accept/decline
-  endpoints exist, they'll trigger these transitions as a side effect.
-- Matching results (`DonorMatch` rows) aren't persisted yet — the engine
-  returns a ranked in-memory list; saving that as `DonorMatch` rows and
-  triggering notifications happens once the API layer around it exists.
-- All status transitions are currently owner-only, same as other
-  blood-request writes. Realistically, some transitions (e.g. a donor
-  accepting) should be donor-initiated, not recipient-initiated — that
-  refinement lands once donor-facing endpoints and authorization exist.
+- No notification endpoints or Notification rows yet — `matchService.js`
+  has `// TODO (Phase 10)` comments exactly where notifications need to be
+  created (on new match, on accept, on decline); the next phase fills
+  these in and adds `GET /api/notifications` / `PUT /api/notifications/:id/read`.
+- `requestsReceived` increments once per donor per request (the first time
+  they're matched), which is correct, but there's no equivalent tracking
+  for "how many times has this donor's phone/email actually been used to
+  contact them" — that's a notification-system concern, not this layer's.
+- If two donors are both `PENDING` on the same request and one accepts,
+  the other's `PENDING` match is left dangling rather than being
+  auto-declined. Accepting it later correctly fails (`400`, request no
+  longer `DONOR_CONTACTED`), but a nicer UX would proactively decline the
+  remaining pending matches the moment one is accepted — not implemented,
+  to keep this phase's scope focused.
+- `GET /api/requests/:id/matches` intentionally has a side effect (see the
+  REST-semantics note above) — a stricter API would split trigger and
+  read into separate endpoints.
 - Logout is client-side only (delete the token) — there's no server-side
   token blacklist, so a stolen token remains valid until it expires (7
   days). A production system might add a short-lived access token + refresh

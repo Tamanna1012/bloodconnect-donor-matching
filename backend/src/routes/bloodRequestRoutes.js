@@ -7,6 +7,7 @@ import {
   transitionStatus,
   remove,
 } from '../controllers/bloodRequestController.js'
+import { findMatches } from '../controllers/matchController.js'
 import { requireAuth } from '../middleware/authMiddleware.js'
 
 const router = Router()
@@ -19,6 +20,7 @@ router.use(requireAuth)
 router.post('/', create)
 router.get('/', list)
 router.get('/:id', getOne)
+router.get('/:id/matches', findMatches)
 router.put('/:id', update)
 router.put('/:id/status', transitionStatus)
 router.delete('/:id', remove)
