@@ -2,14 +2,16 @@
 
 Blood Donor–Recipient Matching & Emergency Alert System.
 
-> **Status: Phase 5 — Blood compatibility function.** Frontend/backend
+> **Status: Phase 6 — Donor matching & ranking engine.** Frontend/backend
 > scaffolds are wired together, the PostgreSQL schema is migrated, users
-> can register/log in, `BloodRequest` CRUD has ownership checks, and there's
-> now a pure, deterministic `isCompatible()` function implementing the
-> standard ABO/Rh transfusion rule (verified against all 64 donor/recipient
-> combinations). The full donor-ranking matching engine, donor-side
-> endpoints, and the formal request state machine are not built yet — they
-> arrive in later phases. This README will be expanded into a full project
+> can register/log in, `BloodRequest` CRUD has ownership checks, and the
+> core feature of the project now exists: a deterministic algorithm that
+> hard-filters donors by blood-group compatibility and availability, then
+> ranks the eligible ones by proximity (Haversine), urgency, and a simple
+> reliability score. It's verified against real Postgres-backed data, not
+> just hand-written test objects. Donor-facing API endpoints, the formal
+> request state machine, and notifications are not built yet — they arrive
+> in later phases. This README will be expanded into a full project
 > write-up (architecture, matching algorithm, API reference, setup, testing,
 > deployment, limitations) as those phases are completed.
 
@@ -47,7 +49,10 @@ bloodconnect-donor-matching/
 │       ├── services/
 │       │   ├── authService.js            auth business logic (bcrypt + JWT)
 │       │   ├── bloodRequestService.js    CRUD + ownership enforcement
-│       │   └── bloodCompatibility.js     isCompatible() — ABO/Rh screening rule
+│       │   ├── bloodCompatibility.js     isCompatible() — ABO/Rh screening rule
+│       │   ├── proximity.js              Haversine distance + proximity score
+│       │   ├── donorReliability.js       reliability score from donor history
+│       │   └── bloodMatchingEngine.js    hard filters + ranking (the core feature)
 │       ├── middleware/
 │       │   └── authMiddleware.js   requireAuth — protects routes via JWT
 │       ├── utils/
@@ -59,6 +64,9 @@ bloodconnect-donor-matching/
 │       │   ├── auth.service.test.js
 │       │   ├── authMiddleware.test.js
 │       │   ├── bloodRequest.service.test.js
+│       │   ├── proximity.test.js
+│       │   ├── donorReliability.test.js
+│       │   ├── bloodMatchingEngine.test.js
 │       │   └── bloodCompatibility.test.js
 │       ├── app.js         Express app + middleware + routes
 │       └── server.js      starts the HTTP server
@@ -142,6 +150,80 @@ landmark cases (O- universal donor, AB+ universal recipient, etc).
 donors for the app's matching engine. It is never a substitute for the
 actual cross-match and medical verification a blood bank performs before
 any real transfusion.
+
+## Donor matching & ranking engine (the core feature)
+
+`backend/src/services/bloodMatchingEngine.js` is the most important file in
+this project. Given a `BloodRequest` and a list of candidate
+`DonorProfile`s, `rankDonorsForRequest(request, donorProfiles)` returns
+only the eligible donors, sorted best-match-first. No AI/LLM is involved —
+every number it produces is explainable in one sentence.
+
+**The algorithm has two distinct phases, and keeping them separate matters:**
+
+1. **Hard filters** (`isEligibleDonor`) — binary, non-negotiable gates. A
+   donor is excluded entirely, not just penalized, if either fails:
+   - **Blood-group compatibility** — `isCompatible(donor.bloodGroup, request.bloodGroup)`
+   - **Availability** — `donor.isAvailable === true`
+
+   A high score from being nearby must never be able to "outweigh" being
+   medically incompatible — that's why these are filters, not scored
+   inputs.
+
+2. **Ranking score** (`scoreDonor`) — among donors who passed both hard
+   filters, three factors combine into a `totalScore` (0–100):
+
+   | Component | Range | Source |
+   |---|---|---|
+   | Proximity | 0–40 | `proximity.js` — Haversine distance in km, bucketed (≤5km→40 ... >100km→0); falls back to same-city (25) vs different-city (5) when coordinates aren't available |
+   | Urgency | 0–30 | `NORMAL`→0, `URGENT`→15, `EMERGENCY`→30 |
+   | Reliability | 0–30 | `donorReliability.js` — see below |
+
+   The list is then sorted by `totalScore`, descending.
+
+**Donor reliability** (`donorReliability.js`) is a simple, rule-based
+metric over counters already on `DonorProfile` (`requestsReceived`,
+`requestsAccepted`, `donationsCompleted`) — no machine learning:
+
+```
+acceptanceRate = requestsAccepted / requestsReceived   (0.5 if the donor has no history yet)
+reliabilityScore = round(acceptanceRate × 20 + min(donationsCompleted, 5) × 2)
+```
+
+A brand-new donor gets a neutral score instead of zero (so being new isn't
+punished), and the completed-donations bonus is capped so a very long
+history can't unfairly dominate the score.
+
+**Privacy note:** a donor's exact latitude/longitude is used only inside
+`calculateProximityScore`'s internal Haversine calculation — it is never
+returned in any API response. Only the resulting *score* leaves this
+function, so a donor's precise location is never exposed publicly.
+
+**On the request lifecycle:** `validateRequestForMatching` refuses to
+match a `FULFILLED` or `CANCELLED` request — matching only makes sense
+while a request is still `OPEN` or `MATCHING`. This is a preview of the
+formal state machine built in a later phase.
+
+I verified the full engine against real Postgres data (not just hand-built
+test objects): seeded 5 donors with different blood groups, cities,
+coordinates, and reliability histories against a real `EMERGENCY A_POS`
+request, fetched everything back through Prisma, and ran the actual
+`rankDonorsForRequest`. Result:
+
+```
+Request: A_POS x2, EMERGENCY, Chennai
+
+Ranked eligible donors (highest score first):
+  Nearby Reliable O-neg        total=98 (proximity=40, urgency=30, reliability=28)
+  Nearby Unreliable A-pos      total=72 (proximity=40, urgency=30, reliability=2)
+  Far Reliable O-neg           total=58 (proximity=0,  urgency=30, reliability=28)
+
+(2 of 5 donors were excluded by hard filters: incompatible blood group or unavailable)
+```
+
+The B+ donor (incompatible) and the unavailable A- donor were correctly
+excluded before scoring even started; among the 3 eligible donors, distance
+and reliability both visibly move the ranking exactly as designed.
 
 ## Authentication
 
@@ -245,25 +327,34 @@ npm test
 ```
 
 Runs Node's built-in test runner (`node --test`) against
-`backend/src/tests/*.test.js`. Most of these are integration tests — they
-hit a real Postgres database through Prisma (using whatever `DATABASE_URL`
-is in your `.env`), not a mock, and clean up the rows they create
-afterward. `bloodCompatibility.test.js` is a pure unit test — no database
-involved, since `isCompatible()` is a pure function. Current coverage (20
-tests): registration success, duplicate-email rejection, login success,
-wrong-password rejection, the auth middleware rejecting missing/invalid
-tokens, blood-request CRUD, ownership rejection (a non-owner getting 403 on
-update/cancel), and all 64 ABO/Rh compatibility combinations.
+`backend/src/tests/*.test.js`. Auth and blood-request tests are
+integration tests — they hit a real Postgres database through Prisma
+(using whatever `DATABASE_URL` is in your `.env`), not a mock, and clean
+up the rows they create afterward. `bloodCompatibility.test.js`,
+`proximity.test.js`, `donorReliability.test.js`, and
+`bloodMatchingEngine.test.js` are pure unit tests — no database involved,
+since the matching engine's core logic takes plain objects and has no
+side effects. Current coverage (42 tests) includes: registration/login/
+duplicate-email/wrong-password, auth-middleware rejection, blood-request
+CRUD + ownership rejection, all 64 ABO/Rh compatibility combinations,
+Haversine distance correctness and proximity score buckets, reliability
+scoring (new donor / high vs low acceptance / donation-bonus cap), and the
+matching engine itself (compatible donor accepted, incompatible/unavailable
+donor rejected, nearer donor ranked higher, emergency scores higher, more
+reliable donor ranked higher, invalid request status rejected).
 
 ## Limitations (current phase)
 
-- No matching engine yet — `BloodRequest`s exist but nothing finds/ranks
-  donors for them yet.
-- No donor-side or notification endpoints yet — only auth + blood-request
-  endpoints exist so far.
+- No donor-side or notification endpoints yet — the matching engine
+  (`bloodMatchingEngine.js`) is fully built and tested, but there's no
+  `GET /api/requests/:id/matches` HTTP endpoint yet, and no way to create
+  a `DonorProfile` via the API — those need the REST API phase.
 - No formal request state machine yet — `DELETE` sets `status: CANCELLED`
   directly rather than going through a validated transition function; that
   comes in a later phase.
+- Matching results (`DonorMatch` rows) aren't persisted yet — the engine
+  returns a ranked in-memory list; saving that as `DonorMatch` rows and
+  triggering notifications happens once the API layer around it exists.
 - Logout is client-side only (delete the token) — there's no server-side
   token blacklist, so a stolen token remains valid until it expires (7
   days). A production system might add a short-lived access token + refresh
