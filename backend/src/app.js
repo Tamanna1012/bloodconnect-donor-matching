@@ -6,10 +6,18 @@ import bloodRequestRoutes from './routes/bloodRequestRoutes.js'
 import donorRoutes from './routes/donorRoutes.js'
 import matchRoutes from './routes/matchRoutes.js'
 import notificationRoutes from './routes/notificationRoutes.js'
+import { errorHandler, notFoundHandler } from './middleware/errorHandler.js'
 
 const app = express()
 
-app.use(cors())
+// In development, allow the Vite dev server's default origin as a
+// fallback so the project works out of the box before FRONTEND_URL is
+// set. In production, FRONTEND_URL must be set -- without it, no browser
+// origin is allowed to call this API at all, which is the safe default
+// (fail closed, not open).
+const allowedOrigins = [process.env.FRONTEND_URL, 'http://localhost:5173'].filter(Boolean)
+
+app.use(cors({ origin: allowedOrigins }))
 app.use(express.json())
 
 app.get('/api/health', async (req, res) => {
@@ -26,5 +34,13 @@ app.use('/api/requests', bloodRequestRoutes)
 app.use('/api/donors', donorRoutes)
 app.use('/api/matches', matchRoutes)
 app.use('/api/notifications', notificationRoutes)
+
+// Order matters below: an unmatched route falls through to
+// notFoundHandler, and any error thrown/forwarded by a route (via
+// asyncHandler) falls through to errorHandler. Both must be registered
+// after every real route, and errorHandler must be last of all --
+// Express identifies it as error-handling middleware by its 4 arguments.
+app.use(notFoundHandler)
+app.use(errorHandler)
 
 export default app

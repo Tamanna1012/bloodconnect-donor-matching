@@ -4,35 +4,24 @@ import {
   acceptMatch,
   declineMatch,
 } from '../services/matchService.js'
+import { asyncHandler } from '../middleware/asyncHandler.js'
 
-export async function listMine(req, res) {
+export const listMine = asyncHandler(async (req, res) => {
   const matches = await listMyMatches(req.user.id, req.query.status)
   res.status(200).json({ matches })
-}
+})
 
-export async function findMatches(req, res) {
-  try {
-    const matches = await findMatchesForRequest(req.params.id, req.user.id)
-    res.status(200).json({ matches })
-  } catch (err) {
-    res.status(err.statusCode || 500).json({ error: err.message })
-  }
-}
+export const findMatches = asyncHandler(async (req, res) => {
+  const matches = await findMatchesForRequest(req.params.id, req.user.id)
+  res.status(200).json({ matches })
+})
 
-export async function accept(req, res) {
-  try {
-    const match = await acceptMatch(req.params.id, req.user.id)
-    res.status(200).json({ match })
-  } catch (err) {
-    res.status(err.statusCode || 500).json({ error: err.message })
-  }
-}
+export const accept = asyncHandler(async (req, res) => {
+  const match = await acceptMatch(req.params.id, req.user.id)
+  res.status(200).json({ match })
+})
 
-export async function decline(req, res) {
-  try {
-    const match = await declineMatch(req.params.id, req.user.id)
-    res.status(200).json({ match })
-  } catch (err) {
-    res.status(err.statusCode || 500).json({ error: err.message })
-  }
-}
+export const decline = asyncHandler(async (req, res) => {
+  const match = await declineMatch(req.params.id, req.user.id)
+  res.status(200).json({ match })
+})

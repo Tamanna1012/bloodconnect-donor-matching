@@ -2,20 +2,15 @@
 
 Blood Donor–Recipient Matching & Emergency Alert System.
 
-> **Status: Phase 11 — Frontend.** The backend is functionally complete
-> (auth, authorization, matching, reliability, state machine, REST APIs,
-> notifications) and now has a full React frontend on top of it: Landing,
-> Register, Login, Dashboard, Donor Profile, Create Request, My Requests,
-> Request Details, Find Donors, Notifications, Settings. The complete
-> donor↔recipient loop — register, set up a donor profile, create a
-> request, find matches, accept, get notified, mark fulfilled — was
-> verified end to end in a real browser, which surfaced and fixed two
-> genuine bugs a code-only review wouldn't have caught (see "Donor
-> matching & ranking engine" and "Testing" below). What's left is security
-> hardening and deployment. This README will be expanded into a full
-> project write-up (architecture, matching algorithm, API reference,
-> setup, testing, deployment, limitations) as remaining phases are
-> completed.
+> **Status: Phase 12 — Security hardening.** The full stack (backend +
+> React frontend) works end to end. This phase added: CORS restricted to
+> an explicit allowed origin instead of wide open, centralized Express
+> error handling (removed ~20 repeated try/catch blocks across every
+> controller), basic rate limiting on the auth endpoints, and an
+> environment-variable review. What's left is deployment. This README
+> will be expanded into a full project write-up (architecture, matching
+> algorithm, API reference, setup, testing, deployment, limitations) as
+> the remaining phase is completed.
 
 ## What is this project?
 
@@ -87,7 +82,10 @@ bloodconnect-donor-matching/
 │       │   ├── bloodMatchingEngine.js    hard filters + ranking (the core feature)
 │       │   └── requestStateMachine.js    valid BloodRequest.status transitions
 │       ├── middleware/
-│       │   └── authMiddleware.js   requireAuth — protects routes via JWT
+│       │   ├── authMiddleware.js   requireAuth — protects routes via JWT
+│       │   ├── asyncHandler.js     forwards async errors to errorHandler
+│       │   ├── errorHandler.js     centralized error + 404 responses
+│       │   └── rateLimiter.js      basic rate limit on auth endpoints
 │       ├── utils/
 │       │   ├── prisma.js           shared PrismaClient instance
 │       │   ├── jwt.js              sign/verify JWT helpers
@@ -567,6 +565,76 @@ reading the code alone.
    speculatively: each is used by a specific page built in this same
    phase, not "for later."
 
+## Security
+
+A checklist of what's in place, and why each piece exists:
+
+- **Password hashing (bcrypt)** and **JWT authentication** — Phase 3.
+- **Authorization / ownership checks** on every resource that has an
+  owner — Phase 4 (blood requests), Phase 9 (donor matches, via the same
+  generic `assertOwnership` helper).
+- **Input validation, server-side, on every write** — every controller
+  validates its own inputs (`isValidBloodGroup`, `isValidEmail`,
+  `isPositiveInteger`, etc.) independent of whatever the frontend's HTML
+  form attributes (`required`, `minLength`) already checked. The frontend
+  validation is a UX nicety — it saves a round trip for an honest user —
+  but it is not a security boundary: nothing stops a request from being
+  sent with `curl` instead of through the React app, so the backend must
+  never assume a request came from, or was validated by, the frontend.
+- **CORS** (`app.js`) — `cors({ origin: allowedOrigins })` instead of the
+  previous bare `cors()` (which allowed literally any website's
+  JavaScript to call this API from a browser). `allowedOrigins` reads
+  `FRONTEND_URL` from the environment, with `localhost:5173` as a
+  dev-only fallback. In production, if `FRONTEND_URL` isn't set, **no**
+  browser origin is allowed — fail closed, not open.
+- **Centralized error handling** (`middleware/asyncHandler.js` +
+  `middleware/errorHandler.js`) — every controller used to repeat
+  `try { ... } catch (err) { res.status(err.statusCode || 500).json(...) } `.
+  `asyncHandler` wraps a controller so a thrown/rejected error is forwarded
+  to Express's error pipeline (`next(err)`) instead of needing a local
+  catch; `errorHandler.js`, registered last in `app.js`, is the one place
+  that turns any error into a response. Beyond removing ~20 duplicated
+  blocks, this has a real security benefit: a *genuinely unexpected*
+  error (statusCode 500 — a bug, a database outage) returns a generic
+  "Something went wrong" message and gets logged server-side, instead of
+  leaking `err.message` (which could contain internal details like SQL or
+  file paths) to the client. Expected errors we threw ourselves
+  (400/401/403/404, always via `httpError()`) still return their real,
+  intentionally-written message, since those are safe by construction.
+- **Basic rate limiting** (`middleware/rateLimiter.js`, via
+  `express-rate-limit`) — `/api/auth/register` and `/api/auth/login`
+  share a budget of 20 requests per IP per 15 minutes. This is what stops
+  someone from scripting thousands of password guesses against one
+  account, or spam-registering accounts. Deliberately *not* applied
+  globally — rate-limiting every route would make normal use (a
+  recipient refreshing their dashboard) fragile for no real security
+  gain; login/register are the specific brute-forceable endpoints.
+- **Environment variables** — `DATABASE_URL`, `JWT_SECRET`, and now
+  `FRONTEND_URL` are all read from `.env` (gitignored) and documented in
+  `.env.example` with no real secret ever committed. `JWT_SECRET` has no
+  insecure fallback: `jwt.sign()` with `undefined` throws immediately
+  rather than silently signing tokens with a guessable default.
+
+**Explicitly out of scope**, per the spec's own instruction not to turn
+this into a cybersecurity project: no `helmet` security-headers
+middleware, no CSRF protection (not needed for a stateless
+Bearer-token API — CSRF is a cookie-auth problem), no input sanitization
+library, no dependency-vulnerability scanning. These are reasonable
+additions for a real production deployment, not requirements for this
+project's stated scope.
+
+I verified all of this live against the running server: a preflight
+request from `http://localhost:5173` gets the CORS header back, the same
+request from `http://evil.com` does not (a real browser would block the
+response); an unknown route returns a clean `404 {"error":"Not found"}`
+via `notFoundHandler`; a real thrown error (registering a duplicate
+email) still correctly returns its specific `409` message through the
+new centralized pipeline; and 25 rapid login attempts got exactly 18
+through before the 19th returned `429 {"error":"Too many attempts..."}`
+— the limit is shared across `/register` and `/login` by design (one
+combined attempt budget per IP), and the numbers lined up exactly with
+the requests I'd already sent in that window.
+
 ## Running locally
 
 ### Backend
@@ -588,6 +656,10 @@ You need a running PostgreSQL instance and a `DATABASE_URL` in `.env`:
 You also need a `JWT_SECRET` in `.env` — generate your own with
 `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`.
 Never commit the real value or reuse it across environments.
+
+`FRONTEND_URL` controls CORS — set it to wherever your frontend actually
+runs (`http://localhost:5173` for local dev, your real deployed URL in
+production). Requests from any other browser origin are rejected.
 
 Backend runs at `http://localhost:5000`. Health check (also pings the DB):
 `curl http://localhost:5000/api/health` →
@@ -684,5 +756,17 @@ fails.
   token blacklist, so a stolen token remains valid until it expires (7
   days). A production system might add a short-lived access token + refresh
   token pair; out of scope here to keep things explainable.
+- Rate limiting is in-memory (per `express-rate-limit`'s default store) —
+  fine for a single server process, but it would reset on every restart
+  and wouldn't be shared across multiple server instances behind a load
+  balancer. A production deployment with more than one backend instance
+  would need a shared store (e.g. Redis-backed), which is out of scope
+  for this project's single-instance deployment target (Render).
+- No automated tests for the security middleware itself (CORS,
+  rate-limiting, centralized error handling) — these are thin,
+  well-verified wrappers around mature libraries (`cors`,
+  `express-rate-limit`) and Express's own error-routing, and were
+  verified live against the running server instead (see above). The
+  business-logic tests (80 of them) remain the actual safety net.
 
 These are addressed in later phases.
