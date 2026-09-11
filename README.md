@@ -2,18 +2,18 @@
 
 Blood Donor–Recipient Matching & Emergency Alert System.
 
-> **Status: Phase 6 — Donor matching & ranking engine.** Frontend/backend
-> scaffolds are wired together, the PostgreSQL schema is migrated, users
-> can register/log in, `BloodRequest` CRUD has ownership checks, and the
-> core feature of the project now exists: a deterministic algorithm that
-> hard-filters donors by blood-group compatibility and availability, then
-> ranks the eligible ones by proximity (Haversine), urgency, and a simple
-> reliability score. It's verified against real Postgres-backed data, not
-> just hand-written test objects. Donor-facing API endpoints, the formal
-> request state machine, and notifications are not built yet — they arrive
-> in later phases. This README will be expanded into a full project
-> write-up (architecture, matching algorithm, API reference, setup, testing,
-> deployment, limitations) as those phases are completed.
+> **Status: Phase 8 — Request state machine.** Frontend/backend scaffolds
+> are wired together, the PostgreSQL schema is migrated, users can
+> register/log in, `BloodRequest` CRUD has ownership checks, the core
+> donor matching/ranking engine exists and is verified against real
+> Postgres data, and `BloodRequest.status` now moves only through a
+> validated set of transitions (`OPEN → MATCHING → DONOR_CONTACTED →
+> ACCEPTED → FULFILLED`, with `CANCELLED` reachable from most states, and
+> `FULFILLED`/`CANCELLED` as terminal states) instead of being freely
+> overwritable. Donor-facing API endpoints and notifications are not built
+> yet — they arrive in later phases. This README will be expanded into a
+> full project write-up (architecture, matching algorithm, API reference,
+> setup, testing, deployment, limitations) as those phases are completed.
 
 ## What is this project?
 
@@ -52,7 +52,8 @@ bloodconnect-donor-matching/
 │       │   ├── bloodCompatibility.js     isCompatible() — ABO/Rh screening rule
 │       │   ├── proximity.js              Haversine distance + proximity score
 │       │   ├── donorReliability.js       reliability score from donor history
-│       │   └── bloodMatchingEngine.js    hard filters + ranking (the core feature)
+│       │   ├── bloodMatchingEngine.js    hard filters + ranking (the core feature)
+│       │   └── requestStateMachine.js    valid BloodRequest.status transitions
 │       ├── middleware/
 │       │   └── authMiddleware.js   requireAuth — protects routes via JWT
 │       ├── utils/
@@ -66,6 +67,8 @@ bloodconnect-donor-matching/
 │       │   ├── bloodRequest.service.test.js
 │       │   ├── proximity.test.js
 │       │   ├── donorReliability.test.js
+│       │   ├── requestStateMachine.test.js
+│       │   ├── bloodRequestStateMachine.service.test.js
 │       │   ├── bloodMatchingEngine.test.js
 │       │   └── bloodCompatibility.test.js
 │       ├── app.js         Express app + middleware + routes
@@ -225,6 +228,52 @@ The B+ donor (incompatible) and the unavailable A- donor were correctly
 excluded before scoring even started; among the 3 eligible donors, distance
 and reliability both visibly move the ranking exactly as designed.
 
+## Request state machine
+
+`BloodRequest.status` doesn't move freely between any two values — it
+follows a fixed set of legal transitions, defined once in
+`backend/src/services/requestStateMachine.js`:
+
+```
+OPEN            → MATCHING, CANCELLED
+MATCHING        → DONOR_CONTACTED, CANCELLED
+DONOR_CONTACTED → ACCEPTED, MATCHING, CANCELLED    (donor declines -> back to searching)
+ACCEPTED        → FULFILLED, MATCHING, CANCELLED   (accepted donor backs out -> back to searching)
+FULFILLED       → (terminal — nothing)
+CANCELLED       → (terminal — nothing)
+```
+
+`FULFILLED` and `CANCELLED` are terminal: once a donation is complete or a
+recipient cancels, that's final. `isValidTransition(from, to)` checks the
+table; `assertValidTransition(from, to)` throws a `400` if the move isn't
+listed. `PUT /api/requests/:id/status` is the only way to change status —
+`transitionBloodRequestStatus()` calls `assertValidTransition` before
+writing anything.
+
+**Why a dedicated function instead of just checking status inline
+wherever it's needed?** Because a business rule like "a fulfilled request
+can never be reopened" is an invariant that must hold everywhere the data
+can be touched — a background job, an admin tool, a future feature — not
+just in the one route a developer remembers to guard. Centralizing it
+means every caller automatically gets the same guarantee.
+
+**A real bug this phase fixed:** before this phase, `PUT /api/requests/:id`
+accepted a `status` field in the body and wrote it straight to the
+database with zero validation — `{"status": "FULFILLED"}` would have
+silently "completed" a request that was still sitting at `OPEN` with no
+donor ever contacted. `updateBloodRequest` now explicitly rejects any
+`status` field with a `400`, and `cancelBloodRequest` (the `DELETE`
+endpoint) is rewritten to go through `transitionBloodRequestStatus`, so
+cancelling an already-`FULFILLED` request is correctly rejected instead of
+silently "succeeding."
+
+I verified this live against the running server, replicating the spec's
+own example exactly: walked a real request through the full happy path
+(`OPEN → MATCHING → DONOR_CONTACTED → ACCEPTED → FULFILLED`, each a `200`),
+then confirmed `FULFILLED → OPEN` is rejected with `400` — and confirmed
+`DELETE` on that same now-`FULFILLED` request is also correctly rejected,
+proving the bug above is actually fixed, not just theoretically fixed.
+
 ## Authentication
 
 - **Registration** (`POST /api/auth/register`) — validates input, checks the
@@ -259,8 +308,9 @@ of data. `BloodRequest` is our first real example:
 |---|---|---|
 | Create | `POST /api/requests` | Any logged-in user (becomes the owner) |
 | List / view | `GET /api/requests`, `GET /api/requests/:id` | Any logged-in user — donors need to *browse* requests to be matched, so reads are intentionally open |
-| Update | `PUT /api/requests/:id` | **Only the owner** |
-| Cancel | `DELETE /api/requests/:id` | **Only the owner** |
+| Update (fields) | `PUT /api/requests/:id` | **Only the owner** (cannot change `status` — see state machine below) |
+| Update (status) | `PUT /api/requests/:id/status` | **Only the owner**, and only to a valid next state |
+| Cancel | `DELETE /api/requests/:id` | **Only the owner**, and only if the current status allows a transition to `CANCELLED` |
 
 The check itself lives in `bloodRequestService.js`, not in the route or
 controller — `updateBloodRequest`/`cancelBloodRequest` load the request,
@@ -331,17 +381,17 @@ Runs Node's built-in test runner (`node --test`) against
 integration tests — they hit a real Postgres database through Prisma
 (using whatever `DATABASE_URL` is in your `.env`), not a mock, and clean
 up the rows they create afterward. `bloodCompatibility.test.js`,
-`proximity.test.js`, `donorReliability.test.js`, and
-`bloodMatchingEngine.test.js` are pure unit tests — no database involved,
-since the matching engine's core logic takes plain objects and has no
-side effects. Current coverage (42 tests) includes: registration/login/
-duplicate-email/wrong-password, auth-middleware rejection, blood-request
-CRUD + ownership rejection, all 64 ABO/Rh compatibility combinations,
-Haversine distance correctness and proximity score buckets, reliability
-scoring (new donor / high vs low acceptance / donation-bonus cap), and the
-matching engine itself (compatible donor accepted, incompatible/unavailable
-donor rejected, nearer donor ranked higher, emergency scores higher, more
-reliable donor ranked higher, invalid request status rejected).
+`proximity.test.js`, `donorReliability.test.js`,
+`bloodMatchingEngine.test.js`, and `requestStateMachine.test.js` are pure
+unit tests — no database involved. Current coverage (54 tests) includes:
+registration/login/duplicate-email/wrong-password, auth-middleware
+rejection, blood-request CRUD + ownership rejection, all 64 ABO/Rh
+compatibility combinations, Haversine distance correctness and proximity
+score buckets, reliability scoring, the matching engine (hard filters +
+ranking by distance/urgency/reliability), and the request state machine
+(every valid transition, the `FULFILLED → OPEN` rejection, skipped-step
+rejection, non-owner rejection, and cancelling an already-`FULFILLED`
+request being correctly rejected).
 
 ## Limitations (current phase)
 
@@ -349,12 +399,17 @@ reliable donor ranked higher, invalid request status rejected).
   (`bloodMatchingEngine.js`) is fully built and tested, but there's no
   `GET /api/requests/:id/matches` HTTP endpoint yet, and no way to create
   a `DonorProfile` via the API — those need the REST API phase.
-- No formal request state machine yet — `DELETE` sets `status: CANCELLED`
-  directly rather than going through a validated transition function; that
-  comes in a later phase.
+- Nothing calls `transitionBloodRequestStatus` automatically yet — moving
+  a request through `MATCHING`/`DONOR_CONTACTED`/`ACCEPTED` today requires
+  calling `PUT /:id/status` directly. Once donor-match accept/decline
+  endpoints exist, they'll trigger these transitions as a side effect.
 - Matching results (`DonorMatch` rows) aren't persisted yet — the engine
   returns a ranked in-memory list; saving that as `DonorMatch` rows and
   triggering notifications happens once the API layer around it exists.
+- All status transitions are currently owner-only, same as other
+  blood-request writes. Realistically, some transitions (e.g. a donor
+  accepting) should be donor-initiated, not recipient-initiated — that
+  refinement lands once donor-facing endpoints and authorization exist.
 - Logout is client-side only (delete the token) — there's no server-side
   token blacklist, so a stolen token remains valid until it expires (7
   days). A production system might add a short-lived access token + refresh

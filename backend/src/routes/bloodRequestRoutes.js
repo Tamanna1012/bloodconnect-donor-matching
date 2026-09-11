@@ -4,6 +4,7 @@ import {
   list,
   getOne,
   update,
+  transitionStatus,
   remove,
 } from '../controllers/bloodRequestController.js'
 import { requireAuth } from '../middleware/authMiddleware.js'
@@ -19,6 +20,7 @@ router.post('/', create)
 router.get('/', list)
 router.get('/:id', getOne)
 router.put('/:id', update)
+router.put('/:id/status', transitionStatus)
 router.delete('/:id', remove)
 
 export default router

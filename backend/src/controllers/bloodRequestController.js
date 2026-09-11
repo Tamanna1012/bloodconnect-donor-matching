@@ -4,7 +4,9 @@ import {
   getBloodRequestById,
   updateBloodRequest,
   cancelBloodRequest,
+  transitionBloodRequestStatus,
 } from '../services/bloodRequestService.js'
+import { REQUEST_STATE_TRANSITIONS } from '../services/requestStateMachine.js'
 import {
   isValidBloodGroup,
   isValidUrgency,
@@ -65,6 +67,21 @@ export async function update(req, res) {
 
   try {
     const request = await updateBloodRequest(req.params.id, req.user.id, req.body)
+    res.status(200).json({ request })
+  } catch (err) {
+    res.status(err.statusCode || 500).json({ error: err.message })
+  }
+}
+
+export async function transitionStatus(req, res) {
+  const { status } = req.body
+
+  if (!status || !Object.keys(REQUEST_STATE_TRANSITIONS).includes(status)) {
+    return res.status(400).json({ error: 'A valid status is required' })
+  }
+
+  try {
+    const request = await transitionBloodRequestStatus(req.params.id, req.user.id, status)
     res.status(200).json({ request })
   } catch (err) {
     res.status(err.statusCode || 500).json({ error: err.message })
