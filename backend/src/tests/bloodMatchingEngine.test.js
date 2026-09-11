@@ -15,6 +15,7 @@ function makeRequest(overrides = {}) {
     longitude: null,
     urgency: 'NORMAL',
     status: 'OPEN',
+    requesterId: 'recipient-1',
     ...overrides,
   }
 }
@@ -22,6 +23,7 @@ function makeRequest(overrides = {}) {
 function makeDonor(overrides = {}) {
   return {
     id: 'donor-1',
+    userId: 'donor-user-1',
     bloodGroup: 'O_NEG',
     city: 'Chennai',
     latitude: null,
@@ -113,6 +115,16 @@ test('isEligibleDonor is the single source of truth for the hard filters', () =>
   assert.equal(isEligibleDonor(request, makeDonor({ bloodGroup: 'O_NEG', isAvailable: true })), true)
   assert.equal(isEligibleDonor(request, makeDonor({ bloodGroup: 'B_POS', isAvailable: true })), false)
   assert.equal(isEligibleDonor(request, makeDonor({ bloodGroup: 'O_NEG', isAvailable: false })), false)
+})
+
+test('a user cannot be matched to their own request (self-match hard filter)', () => {
+  const request = makeRequest({ bloodGroup: 'O_POS', requesterId: 'same-person' })
+  const ownDonorProfile = makeDonor({ bloodGroup: 'O_NEG', userId: 'same-person' })
+
+  assert.equal(isEligibleDonor(request, ownDonorProfile), false)
+
+  const ranked = rankDonorsForRequest(request, [ownDonorProfile])
+  assert.equal(ranked.length, 0)
 })
 
 test('validateRequestForMatching rejects requests that are already FULFILLED or CANCELLED', () => {

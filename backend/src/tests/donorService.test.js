@@ -4,6 +4,7 @@ import assert from 'node:assert/strict'
 import prisma from '../utils/prisma.js'
 import { registerUser } from '../services/authService.js'
 import {
+  getMyDonorProfile,
   upsertDonorProfile,
   setDonorAvailability,
   listDonorProfiles,
@@ -87,6 +88,24 @@ test('getDonorProfileById throws 404 for a non-existent id', async () => {
       return true
     },
   )
+})
+
+test('getMyDonorProfile returns null (not an error) for a user with no profile yet', async () => {
+  const user = await makeUser('No Profile')
+  const profile = await getMyDonorProfile(user.id)
+  assert.equal(profile, null)
+  await prisma.user.delete({ where: { id: user.id } })
+})
+
+test('getMyDonorProfile returns the full (unsanitized) record for the owning user', async () => {
+  const user = await makeUser('Donor')
+  await upsertDonorProfile(user.id, { bloodGroup: 'O_NEG', city: 'Chennai', latitude: 13.08, longitude: 80.27 })
+
+  const profile = await getMyDonorProfile(user.id)
+  assert.equal(profile.latitude, 13.08) // unlike the public/sanitized view
+
+  await prisma.donorProfile.deleteMany({ where: { userId: user.id } })
+  await prisma.user.delete({ where: { id: user.id } })
 })
 
 after(async () => {

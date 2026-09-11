@@ -109,6 +109,25 @@ export async function findMatchesForRequest(requestId, requestingUserId) {
   }))
 }
 
+// A donor's own view of the requests they've been matched to. Without
+// this, a donor has no way to discover their own match ids -- every other
+// match endpoint requires already knowing one. Necessary for the
+// Dashboard ("incoming requests") and Notifications pages, not built
+// speculatively.
+export async function listMyMatches(donorUserId, statusFilter) {
+  const donorProfile = await prisma.donorProfile.findUnique({ where: { userId: donorUserId } })
+  if (!donorProfile) return []
+
+  const where = { donorProfileId: donorProfile.id }
+  if (statusFilter) where.status = statusFilter
+
+  return prisma.donorMatch.findMany({
+    where,
+    include: { request: true },
+    orderBy: { createdAt: 'desc' },
+  })
+}
+
 export async function listMatchesForRequest(requestId, requestingUserId) {
   const request = await getBloodRequestById(requestId)
   assertOwnership(request.requesterId, requestingUserId, 'blood request')

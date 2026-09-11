@@ -1,18 +1,31 @@
 import prisma from '../utils/prisma.js'
 import { assertFound } from '../utils/httpErrors.js'
+import { calculateReliabilityScore } from './donorReliability.js'
 
 // Public view of a donor: no exact coordinates, no linked user contact
 // info (email/phone) -- only what's needed to browse/display a donor.
 // A donor's own view of their own profile (e.g. after PUT) skips this
 // and sees the full record, since there's no privacy concern with a user
-// seeing their own data.
+// seeing their own data. reliabilityScore is attached here (not stored)
+// since it's always derived fresh from the counters -- the same formula
+// from Phase 6/7, just finally surfaced through the API.
 export function sanitizeDonorProfile(donorProfile) {
   const { latitude, longitude, user, ...rest } = donorProfile
   return {
     ...rest,
     donorName: user?.name,
     city: donorProfile.city,
+    reliabilityScore: calculateReliabilityScore(donorProfile),
   }
+}
+
+// Not found is a normal state here (most users aren't donors yet), so
+// this returns null instead of throwing a 404 -- the frontend just checks
+// truthiness to decide whether to show "create your donor profile."
+export async function getMyDonorProfile(userId) {
+  const profile = await prisma.donorProfile.findUnique({ where: { userId } })
+  if (!profile) return null
+  return { ...profile, reliabilityScore: calculateReliabilityScore(profile) }
 }
 
 export async function upsertDonorProfile(userId, data) {

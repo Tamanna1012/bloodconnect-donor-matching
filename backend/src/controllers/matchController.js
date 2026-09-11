@@ -1,8 +1,14 @@
 import {
   findMatchesForRequest,
+  listMyMatches,
   acceptMatch,
   declineMatch,
 } from '../services/matchService.js'
+
+export async function listMine(req, res) {
+  const matches = await listMyMatches(req.user.id, req.query.status)
+  res.status(200).json({ matches })
+}
 
 export async function findMatches(req, res) {
   try {

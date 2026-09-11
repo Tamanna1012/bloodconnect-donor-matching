@@ -2,17 +2,17 @@
 
 Blood Donor–Recipient Matching & Emergency Alert System.
 
-> **Status: Phase 10 — In-app notifications.** The backend is functionally
-> complete: register/login, blood-request CRUD with ownership, the
-> donor-matching/ranking engine, the request state machine, donor
-> profiles, match accept/decline, and now database-backed notifications
-> fire at every meaningful event (a donor is matched, a recipient's donors
-> are contacted, a donor accepts/declines, a donation is marked
-> fulfilled) — the last one also finally closes the loop on
-> `donationsCompleted`, the field the Phase 6/7 reliability score depends
-> on. Verified live end to end against the running server. What's left is
-> the React frontend (so far only a health-check page exists), security
-> hardening, and deployment. This README will be expanded into a full
+> **Status: Phase 11 — Frontend.** The backend is functionally complete
+> (auth, authorization, matching, reliability, state machine, REST APIs,
+> notifications) and now has a full React frontend on top of it: Landing,
+> Register, Login, Dashboard, Donor Profile, Create Request, My Requests,
+> Request Details, Find Donors, Notifications, Settings. The complete
+> donor↔recipient loop — register, set up a donor profile, create a
+> request, find matches, accept, get notified, mark fulfilled — was
+> verified end to end in a real browser, which surfaced and fixed two
+> genuine bugs a code-only review wouldn't have caught (see "Donor
+> matching & ranking engine" and "Testing" below). What's left is security
+> hardening and deployment. This README will be expanded into a full
 > project write-up (architecture, matching algorithm, API reference,
 > setup, testing, deployment, limitations) as remaining phases are
 > completed.
@@ -40,19 +40,40 @@ clinical decisions.
 ```
 bloodconnect-donor-matching/
 ├── frontend/   React app (Vite + Tailwind + React Router)
+│   └── src/
+│       ├── api/               one small module per backend resource
+│       │   ├── client.js      shared fetch wrapper (auth header, JSON, errors)
+│       │   ├── auth.js, requests.js, donors.js, matches.js, notifications.js
+│       ├── context/
+│       │   └── AuthContext.jsx   user/token state, login/register/logout
+│       ├── components/
+│       │   ├── Navbar.jsx         auth-aware nav
+│       │   ├── ProtectedRoute.jsx redirects to /login if logged out
+│       │   └── Badges.jsx         UrgencyBadge, StatusBadge (shared)
+│       ├── utils/
+│       │   └── formatters.js  blood group / urgency / status labels (mirrors backend)
+│       ├── pages/
+│       │   ├── Landing.jsx, Register.jsx, Login.jsx
+│       │   ├── Dashboard.jsx      donor status + incoming/accepted matches
+│       │   │                      + recipient's own requests, in one page
+│       │   ├── DonorProfile.jsx, CreateRequest.jsx
+│       │   ├── MyRequests.jsx, RequestDetails.jsx
+│       │   ├── FindDonors.jsx, Notifications.jsx, Settings.jsx
+│       ├── App.jsx      route table
+│       └── main.jsx     AuthProvider + BrowserRouter
 ├── backend/    Express API server
 │   └── src/
 │       ├── controllers/
 │       │   ├── authController.js         register/login/me request handlers
 │       │   ├── bloodRequestController.js create/list/get/update/status/cancel
-│       │   ├── donorController.js        donor profile/availability/browse
-│       │   ├── matchController.js        find matches, accept, decline
+│       │   ├── donorController.js        me/profile/availability/browse
+│       │   ├── matchController.js        mine, find matches, accept, decline
 │       │   └── notificationController.js list, mark read
 │       ├── routes/
 │       │   ├── authRoutes.js             POST /register, POST /login, GET /me
 │       │   ├── bloodRequestRoutes.js     /api/requests CRUD + /:id/matches
-│       │   ├── donorRoutes.js            /api/donors
-│       │   ├── matchRoutes.js            /api/matches/:id/accept, /decline
+│       │   ├── donorRoutes.js            /api/donors (+ /me)
+│       │   ├── matchRoutes.js            /api/matches/mine, /:id/accept, /decline
 │       │   └── notificationRoutes.js     /api/notifications
 │       ├── services/
 │       │   ├── authService.js            auth business logic (bcrypt + JWT)
@@ -180,9 +201,11 @@ every number it produces is explainable in one sentence.
 **The algorithm has two distinct phases, and keeping them separate matters:**
 
 1. **Hard filters** (`isEligibleDonor`) — binary, non-negotiable gates. A
-   donor is excluded entirely, not just penalized, if either fails:
+   donor is excluded entirely, not just penalized, if any fails:
    - **Blood-group compatibility** — `isCompatible(donor.bloodGroup, request.bloodGroup)`
    - **Availability** — `donor.isAvailable === true`
+   - **Not the requester themselves** — `donor.userId !== request.requesterId`
+     (added in Phase 11 — see the bug writeup below)
 
    A high score from being nearby must never be able to "outweigh" being
    medically incompatible — that's why these are filters, not scored
@@ -273,6 +296,24 @@ reliability score for no real reason (see Phase 6/7). Fixed by comparing
 `upsert` — they're only equal on the instant a row is first created, so
 the counter only increments the first time a donor is actually matched to
 a given request, not on every re-run.
+
+**A real bug I found while building the frontend, only visible in a
+browser:** every backend unit and integration test up to this point used
+*separate* users for the recipient and the donor, because that's how the
+tests were written — so nothing ever exercised the case where the same
+person is both. The first time I actually clicked through the app as one
+person — registered, set up a donor profile, then created a blood
+request for myself — the matching engine happily matched me to my own
+request. Nonsensical in the real world (you're not a candidate donor for
+your own need), and not something any existing test would have caught,
+since none of them modeled it. Fixed by adding the third hard filter
+above. I then had to fix the *tests* too: `bloodMatchingEngine.test.js`'s
+fixture helpers previously left `donor.userId` and `request.requesterId`
+both `undefined`, which are `===` to each other in JavaScript — every
+existing test in that file was accidentally already a "self-match"
+without anyone noticing, because nothing asserted on that field before.
+Both fixtures now default to distinct ids, and a dedicated test locks in
+the new filter.
 
 ## Request state machine
 
@@ -457,14 +498,74 @@ how the two ownership paths connect to the same underlying state machine.
 | `PUT /api/requests/:id/status` | owner only | The only way to change `status`; validated by the state machine |
 | `DELETE /api/requests/:id` | owner only | Cancels (sets `status: CANCELLED`) via the state machine, not a hard delete |
 | `GET /api/requests/:id/matches` | owner only | Runs the matching engine, persists `DonorMatch` rows, advances status — see the REST-semantics note above |
+| `GET /api/donors/me` | required | The caller's own `DonorProfile` (unsanitized — full record), or `null` if they haven't set one up yet |
 | `PUT /api/donors/profile` | required | Create/update the caller's own `DonorProfile` (upsert — self-scoped, no id in the URL) |
 | `PUT /api/donors/availability` | required | Toggle the caller's own `isAvailable` |
-| `GET /api/donors` | required | Browse donors (sanitized — no exact coordinates); optional `?bloodGroup=`, `?city=` filters |
+| `GET /api/donors` | required | Browse donors (sanitized — no exact coordinates); optional `?bloodGroup=`, `?city=` filters; includes `reliabilityScore` |
 | `GET /api/donors/:id` | required | One donor's sanitized public profile |
+| `GET /api/matches/mine` | required | The caller's own `DonorMatch` rows (as a donor), with request details included; optional `?status=` filter — added in Phase 11 for the Dashboard/Notifications pages |
 | `POST /api/matches/:id/accept` | matched donor only | Match → `ACCEPTED`, request → `ACCEPTED`; notifies the recipient |
 | `POST /api/matches/:id/decline` | matched donor only | Match → `DECLINED`, request → `MATCHING` (if still awaiting this donor); notifies the recipient |
 | `GET /api/notifications` | required | The caller's own notifications, newest first |
 | `PUT /api/notifications/:id/read` | owner only | Marks one notification as read |
+
+## Frontend
+
+**Architecture:**
+- `api/client.js` — one shared `fetch` wrapper. Every other `api/*.js` file
+  is a thin, resource-named set of functions (`register()`, `createRequest()`,
+  `acceptMatch()`...) built on top of it, so a page component never calls
+  `fetch` directly.
+- `context/AuthContext.jsx` — React Context holding `{ user, token }`, with
+  `login`/`register`/`logout`. The JWT is persisted to `localStorage` (the
+  backend is stateless — Phase 3 — so the *browser* has to remember who's
+  logged in across page reloads) and re-validated against
+  `GET /api/auth/me` on first load, so a stale/expired token doesn't leave
+  the UI stuck pretending someone is logged in.
+- `components/ProtectedRoute.jsx` — redirects to `/login` if there's no
+  user. This is a **UX** convenience only — the real security boundary is
+  still each endpoint's `requireAuth` middleware on the backend; a user
+  could bypass this component entirely and still couldn't get real data
+  without a valid token.
+
+**Pages:** `Dashboard.jsx` is the most involved — it combines the donor
+view (profile summary, reliability score, availability toggle, incoming
+`PENDING` matches with Accept/Decline, `ACCEPTED` matches) and the
+recipient view (the user's own requests, emergency ones visually
+flagged) in one page, since most users will use both roles over time
+rather than being permanently "a donor" or "a recipient." `RequestDetails.jsx`
+is the second most involved — for the request's owner it exposes "Find
+Matching Donors" (calls the matching endpoint), "Mark as Fulfilled," and
+"Cancel," each gated by the current `status` so an invalid action never
+even renders as a clickable button, on top of the backend's own state
+machine rejecting it anyway (defense in depth: the frontend hides invalid
+actions for UX, the backend refuses them regardless).
+
+**Verified in a real browser**, not just by reading the code: registered
+two separate users (donor + recipient) with Playwright, walked the entire
+flow — donor profile → blood request → find matches → donor sees it on
+their Dashboard → accepts → recipient marks fulfilled → donor gets a
+`REQUEST_FULFILLED` notification — and screenshotted every step. This is
+also how the two Phase 11 bugs below were found; neither was visible from
+reading the code alone.
+
+**Two real bugs found only by clicking through the running app:**
+
+1. **The self-match bug** — described above in "Donor matching & ranking
+   engine." A single test user registering as both donor and recipient
+   (the natural thing to do when manually testing) got matched to their
+   own request. No backend test had ever modeled one person filling both
+   roles.
+2. **Backend endpoints that didn't exist yet, discovered while designing
+   the pages that needed them** — `GET /api/donors/me` (a donor checking
+   their own profile) and `GET /api/matches/mine` (a donor seeing their
+   own incoming/accepted matches) were both missing. Every prior phase's
+   endpoints existed because the *backend* spec listed them; these two
+   existed because the *frontend* genuinely couldn't function without
+   them — Dashboard has no way to show "your donor profile" or "requests
+   matched to you" otherwise. Both were added deliberately, not
+   speculatively: each is used by a specific page built in this same
+   phase, not "for later."
 
 ## Running locally
 
@@ -497,12 +598,14 @@ Backend runs at `http://localhost:5000`. Health check (also pings the DB):
 ```bash
 cd frontend
 npm install
-cp .env.example .env
+cp .env.example .env   # VITE_API_URL, defaults to http://localhost:5000
 npm run dev
 ```
 
-Frontend runs at `http://localhost:5173` and shows a live "Backend status"
-message fetched from the backend's `/api/health` endpoint.
+Frontend runs at `http://localhost:5173`. With the backend also running,
+open it in a browser: register two accounts (one to be the donor, one the
+recipient — or just one, to see the Landing page and forms), set up a
+donor profile, create a blood request, click "Find Matching Donors."
 
 ## Testing
 
@@ -515,27 +618,31 @@ Runs Node's built-in test runner (`node --test`) against
 `backend/src/tests/*.test.js`. Auth, blood-request, donor, match, and
 notification tests are integration tests — they hit a real Postgres
 database through Prisma (using whatever `DATABASE_URL` is in your
-`.env`), not a mock, and clean up the rows they create afterward.
-`bloodCompatibility.test.js`, `proximity.test.js`,
+`.env`), not a mock. `bloodCompatibility.test.js`, `proximity.test.js`,
 `donorReliability.test.js`, `bloodMatchingEngine.test.js`, and
 `requestStateMachine.test.js` are pure unit tests — no database involved.
-Current coverage (75 tests) includes: registration/login/duplicate-email/
-wrong-password, auth-middleware rejection, blood-request CRUD + ownership
-rejection, all 64 ABO/Rh compatibility combinations, Haversine distance
-correctness and proximity score buckets, reliability scoring, the
-matching engine (hard filters + ranking by distance/urgency/reliability),
-the request state machine (every valid transition, the `FULFILLED →
-OPEN` rejection, skipped-step rejection, non-owner rejection, cancelling
-an already-`FULFILLED` request being correctly rejected), donor profile
-CRUD + sanitization + filtering, the full match lifecycle (matching
-creates `DONOR_CONTACTED`, accept drives the request to `ACCEPTED` and
-updates reliability counters, a non-donor can't accept someone else's
-match, decline bounces the request back to `MATCHING`, double-accept/
-double-decline are rejected), and notifications (creation, newest-first
-ordering, mark-as-read ownership rejection, 404 on a bad id, and that
-matching/accept/decline/fulfilling each fire the right notification type
-to the right person, including `rewardDonorOnFulfilled` correctly
-incrementing `donationsCompleted`).
+Current coverage (80 tests) includes everything from earlier phases, plus
+(Phase 11): `GET /api/donors/me` returning `null` (not a 404) for a user
+with no profile yet vs. the full unsanitized record for one who has, and
+the self-match hard filter (`isEligibleDonor` rejects a donor matched
+against their own request; `rankDonorsForRequest` returns an empty list
+for it).
+
+**A testing-hygiene bug, also found by actually re-running things (this
+time the test suite, not the app):** every integration test's cleanup
+call sat at the *end* of the test body — `const scenario = await
+makeScenario(); ...assertions...; await cleanupScenario(scenario)`. The
+moment any assertion threw, the function exited early and cleanup never
+ran, silently leaving `User`/`DonorProfile`/`BloodRequest` rows behind.
+Normally invisible — but `findMatchesForRequest` queries *every*
+`DonorProfile` in the table (correct in production), so one failed test
+run's leftover donor could inflate another, unrelated test's match count
+on the *next* run, cascading into more failures each time. Caught when a
+genuinely correct test failed with "expected 1, got 4" right after the
+self-match fix above. Fixed by wrapping every test body in
+`matchService.test.js` in `try { ... } finally { await
+cleanupScenario(scenario) }`, so cleanup runs whether the test passes or
+fails.
 
 ## Limitations (current phase)
 
@@ -556,6 +663,23 @@ incrementing `donationsCompleted`).
   database until a frontend polls `GET /api/notifications` and displays
   them. This is intentional (the spec explicitly asks for in-app
   notifications only, not third-party services), not an oversight.
+- Notifications don't store a link back to the request/match that
+  triggered them (`Notification` only has `message`/`type`, no foreign
+  key) — a deliberate scope decision to avoid a schema migration for a
+  feature the frontend can approximate: clicking a notification routes
+  generically by `type` (donor-facing types → Dashboard, recipient-facing
+  types → My Requests) rather than deep-linking the exact request.
+- The Dashboard shows only the current user's *own* requests, filtered
+  client-side from `GET /api/requests` (which returns everyone's, by
+  design — see Authorization above) — fine at this project's scale, but a
+  real product would add a `?mine=true` server-side filter instead of
+  shipping every user's requests to every client.
+- No frontend automated tests yet (no Vitest component tests) — the
+  frontend was verified with real, scripted browser sessions
+  (Playwright) rather than unit tests; that's how both Phase 11 bugs were
+  actually found. Formal frontend test coverage is not currently planned,
+  to keep the project's testing effort concentrated on the backend
+  business logic where the real engineering risk lives.
 - Logout is client-side only (delete the token) — there's no server-side
   token blacklist, so a stolen token remains valid until it expires (7
   days). A production system might add a short-lived access token + refresh

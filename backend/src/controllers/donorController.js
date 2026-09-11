@@ -1,4 +1,5 @@
 import {
+  getMyDonorProfile,
   upsertDonorProfile,
   setDonorAvailability,
   listDonorProfiles,
@@ -9,6 +10,11 @@ import {
   isValidLatitude,
   isValidLongitude,
 } from '../utils/validators.js'
+
+export async function getMine(req, res) {
+  const donorProfile = await getMyDonorProfile(req.user.id)
+  res.status(200).json({ donorProfile })
+}
 
 export async function upsertProfile(req, res) {
   const { bloodGroup, city, latitude, longitude } = req.body

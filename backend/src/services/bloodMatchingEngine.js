@@ -28,10 +28,14 @@ export function validateRequestForMatching(request) {
   }
 }
 
-// STEPS 2 & 3: hard filters. Both must pass, or the donor is excluded
-// entirely -- never just given a low score.
+// STEPS 2 & 3 (+ a third hard filter): all must pass, or the donor is
+// excluded entirely -- never just given a low score. A requester cannot
+// be matched to their own request even if they also have a compatible,
+// available donor profile -- found via an end-to-end browser test where
+// a single user acted as both recipient and donor.
 export function isEligibleDonor(request, donorProfile) {
   if (!donorProfile.isAvailable) return false
+  if (donorProfile.userId === request.requesterId) return false
   if (!isCompatible(donorProfile.bloodGroup, request.bloodGroup)) return false
   return true
 }
